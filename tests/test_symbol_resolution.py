@@ -56,10 +56,19 @@ def test_resolve_cross_file_raw_calls_emits_unique_unqualified_call() -> None:
         }
     ]
     nodes = [
-        {"id": "caller_run", "label": "run()", "file_type": "code"},
-        {"id": "helper_helper", "label": "helper()", "file_type": "code"},
+        {"id": "caller_run", "label": "run()", "file_type": "code", "source_file": "caller.py"},
+        {"id": "helper_helper", "label": "helper()", "file_type": "code", "source_file": "helper.py"},
     ]
-    edges = []
+    # Import evidence: caller.py imports the `helper` symbol from helper.py.
+    # Without it the call is a same-name coincidence and must be dropped (#437).
+    edges = [
+        {
+            "source": "caller_file",
+            "target": "helper_helper",
+            "relation": "imports",
+            "source_file": "caller.py",
+        }
+    ]
 
     resolved = resolve_cross_file_raw_calls(per_file, nodes, edges)
 
@@ -136,10 +145,20 @@ def test_resolve_cross_file_raw_calls_skips_existing_pair() -> None:
         }
     ]
     nodes = [
-        {"id": "caller_run", "label": "run()", "file_type": "code"},
-        {"id": "helper_helper", "label": "helper()", "file_type": "code"},
+        {"id": "caller_run", "label": "run()", "file_type": "code", "source_file": "caller.py"},
+        {"id": "helper_helper", "label": "helper()", "file_type": "code", "source_file": "helper.py"},
     ]
-    edges = [{"source": "caller_run", "target": "helper_helper", "relation": "calls"}]
+    # Import evidence is present, so the gate passes; the pre-existing `calls`
+    # edge is what suppresses re-emission (dedup path under test).
+    edges = [
+        {"source": "caller_run", "target": "helper_helper", "relation": "calls"},
+        {
+            "source": "caller_file",
+            "target": "helper_helper",
+            "relation": "imports",
+            "source_file": "caller.py",
+        },
+    ]
     assert resolve_cross_file_raw_calls(per_file, nodes, edges) == []
 
 

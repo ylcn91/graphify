@@ -302,6 +302,54 @@ def resolve_python_import_guided_calls(
     return resolved_edges
 
 
+_IMPORT_EVIDENCE_RELATIONS = frozenset({"imports", "imports_from", "re_exports"})
+
+
+def _import_targets_by_caller_file(
+    all_edges: list[dict[str, Any]],
+) -> dict[str, set[str]]:
+    """Map each importing file's ``source_file`` to the node ids it imports.
+
+    Collects the targets of ``imports`` / ``imports_from`` / ``re_exports``
+    edges, keyed by the edge's ``source_file`` (the importer's path). These
+    targets are either symbol node ids (named imports / re-exports) or
+    module/file node ids (whole-file imports), giving us the deterministic
+    import evidence needed to gate INFERRED cross-file call edges (#437/#540).
+    """
+
+    by_file: dict[str, set[str]] = {}
+    for edge in all_edges:
+        if edge.get("relation") not in _IMPORT_EVIDENCE_RELATIONS:
+            continue
+        source_file = str(edge.get("source_file", ""))
+        target = edge.get("target")
+        if not source_file or not target:
+            continue
+        by_file.setdefault(source_file, set()).add(str(target))
+    return by_file
+
+
+def _file_evidence_ids(source_file: str) -> set[str]:
+    """Return the node ids that a whole-file import of ``source_file`` could match.
+
+    Whole-file imports record their target as ``_make_id`` of either the full
+    module path (relative imports), the bare module name (absolute imports), or
+    the parent-qualified file stem. We mirror ``extract._make_id`` here (via
+    ``_bash_make_id``) so a file-level ``imports_from`` edge can be matched
+    back to the candidate target's defining file without reconstructing the
+    exact import statement.
+    """
+
+    if not source_file:
+        return set()
+    path = Path(source_file)
+    ids = {_bash_make_id(str(path)), _bash_make_id(path.stem)}
+    parent = path.parent.name
+    if parent and parent not in (".", ""):
+        ids.add(_bash_make_id(f"{parent}.{path.stem}"))
+    return ids
+
+
 def resolve_cross_file_raw_calls(
     per_file: Sequence[dict[str, Any] | None],
     all_nodes: list[dict[str, Any]],
@@ -311,13 +359,27 @@ def resolve_cross_file_raw_calls(
 
     This intentionally preserves Graphify's existing behavior:
     - member calls are skipped;
-    - ambiguous labels are skipped;
+    - ambiguous labels (2+ candidates) are skipped;
     - only a single unique candidate is emitted;
     - emitted edges are INFERRED because the raw call alone is not import proof.
+
+    A unique label match is NOT sufficient on its own: short, common function
+    names (``log``, ``execute``, ``find``, ``run``, ``parse``, …) collide across
+    unrelated files and would otherwise invent phantom call edges between
+    same-named-but-unrelated functions (#437/#540). We therefore require actual
+    import evidence — the caller's file must have an ``imports`` /
+    ``imports_from`` / ``re_exports`` edge to the candidate target itself or to
+    the file/module that defines it. Without that evidence the call is dropped.
     """
 
     label_index = build_label_index(all_nodes)
     known_pairs = existing_edge_pairs(all_edges)
+    import_targets_by_file = _import_targets_by_caller_file(all_edges)
+    node_source_file = {
+        str(node["id"]): str(node.get("source_file", ""))
+        for node in all_nodes
+        if node.get("id")
+    }
     resolved: list[dict[str, Any]] = []
 
     for raw_call in iter_raw_calls(per_file):
@@ -335,6 +397,17 @@ def resolve_cross_file_raw_calls(
             continue
         if target == caller:
             continue
+
+        # Gate on real import evidence: the caller's file must import either the
+        # target symbol directly (named import) or the file/module that defines
+        # it. A bare unique-label match is not proof — without an import edge the
+        # call is a same-name coincidence and must be dropped.
+        caller_file = str(raw_call.get("source_file", ""))
+        imported = import_targets_by_file.get(caller_file, set())
+        target_file_ids = _file_evidence_ids(node_source_file.get(target, ""))
+        if target not in imported and imported.isdisjoint(target_file_ids):
+            continue
+
         pair = (caller, target, "calls")
         if pair in known_pairs:
             continue
