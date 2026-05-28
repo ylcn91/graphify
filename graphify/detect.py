@@ -899,6 +899,14 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
     for scan_root in scan_paths:
         in_memory_tree = memory_dir.exists() and str(scan_root).startswith(str(memory_dir))
         for dirpath, dirnames, filenames in os.walk(scan_root, followlinks=follow_symlinks):
+            # Sort in-place so traversal order (descent and per-directory file
+            # order) is deterministic across operating systems. os.walk yields
+            # entries in arbitrary filesystem order, which made same-basename
+            # import resolution OS-nondeterministic (#949): whichever colliding
+            # file is processed first claimed the bare module name. Sorting
+            # dirnames also controls descent order since os.walk reuses the list.
+            dirnames.sort()
+            filenames.sort()
             dp = Path(dirpath)
             if follow_symlinks and os.path.islink(dirpath):
                 real = os.path.realpath(dirpath)

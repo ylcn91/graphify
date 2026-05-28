@@ -23,6 +23,10 @@ class ImportedSymbol:
     module_stem: str
     source_file: str
     source_location: str
+    # Directory-qualified module stem ("pkg_a.settings") when the import names a
+    # package prefix, else "". Used to disambiguate same-basename modules so
+    # `from pkg_a.settings import X` does not collide with `pkg_b.settings` (#949).
+    module_qualified: str = ""
 
 
 def normalise_callable_label(label: str) -> str:
@@ -118,6 +122,25 @@ def _module_stem(module_name: str | None) -> str:
     return module_name.strip(".").split(".")[-1]
 
 
+def _module_qualified_stem(module_name: str | None) -> str:
+    """Return the directory-qualified stem ("pkg_a.settings") of a module path.
+
+    Mirrors :func:`graphify.extract._file_stem`, which qualifies a file by its
+    parent directory name. When the import names a package prefix
+    (``pkg_a.settings``), the last two components are exactly the parent.stem of
+    the defining file, which lets us disambiguate same-basename modules. Returns
+    "" for single-component module names (``settings``), which carry no prefix
+    evidence and must keep using the bare-stem index.
+    """
+
+    if not module_name:
+        return ""
+    components = module_name.strip(".").split(".")
+    if len(components) < 2:
+        return ""
+    return f"{components[-2]}.{components[-1]}"
+
+
 def parse_python_import_aliases(path: Path) -> dict[str, ImportedSymbol]:
     """Parse deterministic Python import aliases from one source file.
 
@@ -152,6 +175,7 @@ def parse_python_import_aliases(path: Path) -> dict[str, ImportedSymbol]:
         module_stem = _module_stem(node.module)
         if not module_stem:
             continue
+        module_qualified = _module_qualified_stem(node.module)
         for alias in node.names:
             if alias.name == "*":
                 continue
@@ -162,6 +186,7 @@ def parse_python_import_aliases(path: Path) -> dict[str, ImportedSymbol]:
                 module_stem=module_stem,
                 source_file=source_file,
                 source_location=f"L{getattr(node, 'lineno', 1)}",
+                module_qualified=module_qualified,
             )
 
     return aliases
@@ -176,12 +201,36 @@ def _node_source_stem(node: dict[str, Any]) -> str:
     return Path(source_file).stem
 
 
+def _node_qualified_stem(node: dict[str, Any]) -> str:
+    """Return the parent-directory-qualified stem ("pkg_a.settings") of a node.
+
+    Mirrors :func:`graphify.extract._file_stem`. Used as the disambiguating key
+    for same-basename modules so import package prefixes can pick the right one
+    (#949). Returns "" when there is no parent directory to qualify with.
+    """
+
+    source_file = str(node.get("source_file", ""))
+    if not source_file:
+        return ""
+    path = Path(source_file)
+    parent = path.parent.name
+    if parent and parent not in (".", ""):
+        return f"{parent}.{path.stem}"
+    return ""
+
+
 def build_python_symbol_index(nodes: list[dict[str, Any]]) -> dict[tuple[str, str], list[str]]:
     """Build ``(module_stem, normalized_symbol_name) -> node_ids``.
 
     This index is stricter than the global label index. It uses both the module
     stem and the symbol label, which allows import evidence to resolve calls that
     global label uniqueness alone cannot safely resolve.
+
+    Each node is indexed under two keys: the bare basename stem (``settings``)
+    and, when it has a parent directory, the directory-qualified stem
+    (``pkg_a.settings``). The qualified key lets imports that name a package
+    prefix disambiguate same-basename modules (#949) without breaking the bare
+    lookup used by single-component imports.
     """
 
     index: dict[tuple[str, str], list[str]] = {}
@@ -198,6 +247,9 @@ def build_python_symbol_index(nodes: list[dict[str, Any]]) -> dict[tuple[str, st
         if not node_id:
             continue
         index.setdefault((source_stem, label), []).append(str(node_id))
+        qualified_stem = _node_qualified_stem(node)
+        if qualified_stem:
+            index.setdefault((qualified_stem, label), []).append(str(node_id))
     return index
 
 
@@ -205,9 +257,20 @@ def find_unique_python_symbol(
     symbol_index: dict[tuple[str, str], list[str]],
     imported: ImportedSymbol,
 ) -> str | None:
-    """Resolve one imported symbol to exactly one Graphify node id."""
+    """Resolve one imported symbol to exactly one Graphify node id.
 
-    candidates = symbol_index.get((imported.module_stem, imported.imported_name.lower()), [])
+    When the import names a package prefix (``from pkg_a.settings import X``) the
+    directory-qualified stem is tried first so same-basename modules resolve to
+    the package the import actually names rather than colliding on the shared
+    bare stem (#949). Single-component imports fall through to the bare-stem key.
+    """
+
+    name = imported.imported_name.lower()
+    if imported.module_qualified:
+        qualified_candidates = symbol_index.get((imported.module_qualified, name), [])
+        if len(qualified_candidates) == 1:
+            return qualified_candidates[0]
+    candidates = symbol_index.get((imported.module_stem, name), [])
     if len(candidates) == 1:
         return candidates[0]
     return None

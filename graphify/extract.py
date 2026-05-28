@@ -5908,8 +5908,14 @@ def _resolve_cross_file_imports(
                 # Absolute: `from models import X`  → module_name field
                 # target_fq is the directory-qualified stem used as the key in
                 # stem_to_entities. Relative imports are resolved exactly via the
-                # importing file's directory; absolute imports fall back to the
-                # bare-stem secondary index (first-writer-wins when names collide).
+                # importing file's directory. Absolute imports that name a package
+                # prefix (`from pkg_a.settings import X`) are disambiguated by that
+                # prefix: the last two components form the directory-qualified stem
+                # (`pkg_a.settings`) that _file_stem produces, so colliding
+                # same-basename modules (pkg_a.settings vs pkg_b.settings) resolve to
+                # the package the import actually names instead of a first-writer-wins
+                # guess (#949). Only single-component absolute imports (`from settings
+                # import X`) fall back to the inherently ambiguous bare-stem index.
                 target_fq: str | None = None
                 for child in node.children:
                     if child.type == "relative_import":
@@ -5924,8 +5930,16 @@ def _resolve_cross_file_imports(
                         break
                     if child.type == "dotted_name" and target_fq is None:
                         raw = source[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
-                        bare = raw.split(".")[-1]
-                        target_fq = bare_to_qualified.get(bare)
+                        components = raw.split(".")
+                        bare = components[-1]
+                        # Prefer the package-prefix-qualified stem (parent.stem) so
+                        # same-basename modules disambiguate by the named package.
+                        if len(components) >= 2:
+                            qualified = f"{components[-2]}.{bare}"
+                            if qualified in stem_to_entities:
+                                target_fq = qualified
+                        if target_fq is None:
+                            target_fq = bare_to_qualified.get(bare)
 
                 if not target_fq or target_fq not in stem_to_entities:
                     return
