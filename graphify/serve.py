@@ -106,6 +106,23 @@ _PREFIX_MATCH_BONUS = 100.0
 _SUBSTRING_MATCH_BONUS = 1.0
 _SOURCE_MATCH_BONUS = 0.5
 
+# Beyond this many words a label is treated as free-form prose (a caption,
+# sentence, or description) rather than a code identifier. A substring hit
+# inside such a label is weak evidence and is damped so it cannot out-compete a
+# precise exact/prefix match on a concise identifier (#449).
+_VERBOSE_LABEL_WORDS = 6
+_VERBOSE_SUBSTRING_FACTOR = 0.1
+
+# file_type weighting (#445): for a code-oriented query, image captions and
+# document blobs frequently match incidentally. Down-weight them relative to
+# code/concept so seed selection prefers substantive nodes when scores are
+# otherwise comparable. This is a tie-break multiplier, not a filter — a node
+# that genuinely dominates still wins.
+_FILE_TYPE_WEIGHTS: dict[str, float] = {
+    "image": 0.2,
+    "document": 0.4,
+}
+
 
 def _compute_idf(G: nx.Graph, terms: list[str]) -> dict[str, float]:
     """IDF weights for query terms, cached in G.graph['_idf_cache'].
@@ -140,6 +157,14 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
         norm_label = data.get("norm_label") or _strip_diacritics(data.get("label") or "").lower()
         bare_label = norm_label.rstrip("()")
         source = (data.get("source_file") or "").lower()
+        # A long, free-form label (prose caption/description) makes incidental
+        # substring hits weak evidence — damp the substring tier for it (#449).
+        is_verbose = len(norm_label.split()) > _VERBOSE_LABEL_WORDS
+        substring_bonus = (
+            _SUBSTRING_MATCH_BONUS * _VERBOSE_SUBSTRING_FACTOR
+            if is_verbose
+            else _SUBSTRING_MATCH_BONUS
+        )
         score = 0.0
         for t in norm_terms:
             w = idf.get(t, 1.0)
@@ -150,10 +175,13 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
             elif norm_label.startswith(t) or bare_label.startswith(t):
                 score += _PREFIX_MATCH_BONUS * w
             elif t in norm_label:
-                score += _SUBSTRING_MATCH_BONUS * w
+                score += substring_bonus * w
             if t in source:
                 score += _SOURCE_MATCH_BONUS * w
         if score > 0:
+            # Down-weight image/document captions so code/concept nodes are
+            # preferred as seeds when matches are comparable (#445).
+            score *= _FILE_TYPE_WEIGHTS.get((data.get("file_type") or "").lower(), 1.0)
             scored.append((score, nid))
     return sorted(scored, reverse=True)
 
