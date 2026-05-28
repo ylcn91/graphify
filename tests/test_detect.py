@@ -627,19 +627,43 @@ def test_gitignore_fallback_when_no_graphifyignore(tmp_path):
     assert not any("generated" in f for f in code)
 
 
-def test_graphifyignore_takes_precedence_over_gitignore(tmp_path):
-    """When both exist, .graphifyignore is used and .gitignore is ignored (#945)."""
+def test_gitignore_and_graphifyignore_both_apply(tmp_path):
+    """When both exist, .gitignore AND .graphifyignore are honored (#1043/#189).
+
+    Previously (#945) .gitignore was a per-dir fallback only used when
+    .graphifyignore was absent. That dropped repos' real build-artifact
+    excludes whenever a .graphifyignore existed. Both files now apply.
+    """
     (tmp_path / ".git").mkdir()
-    # .gitignore would exclude main.py; .graphifyignore excludes only other.py
-    (tmp_path / ".gitignore").write_text("main.py\n")
-    (tmp_path / ".graphifyignore").write_text("other.py\n")
+    (tmp_path / ".gitignore").write_text("from_git.py\n")
+    (tmp_path / ".graphifyignore").write_text("from_graphify.py\n")
     (tmp_path / "main.py").write_text("x = 1")
-    (tmp_path / "other.py").write_text("x = 2")
+    (tmp_path / "from_git.py").write_text("x = 2")
+    (tmp_path / "from_graphify.py").write_text("x = 3")
 
     result = detect(tmp_path)
     code = result["files"]["code"]
-    assert any("main.py" in f for f in code)       # gitignore NOT applied
-    assert not any("other.py" in f for f in code)  # graphifyignore IS applied
+    assert any("main.py" in f for f in code)
+    assert not any("from_git.py" in f for f in code)       # .gitignore applied
+    assert not any("from_graphify.py" in f for f in code)  # .graphifyignore applied
+
+
+def test_graphifyignore_negation_wins_over_gitignore(tmp_path):
+    """.graphifyignore can re-include a file its .gitignore excludes (#1043).
+
+    Within one directory .gitignore is read before .graphifyignore, so a
+    graphify-specific ! negation wins on conflict via last-match-wins.
+    """
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".gitignore").write_text("*.py\n")
+    (tmp_path / ".graphifyignore").write_text("!keep.py\n")
+    (tmp_path / "keep.py").write_text("x = 1")
+    (tmp_path / "drop.py").write_text("x = 2")
+
+    result = detect(tmp_path)
+    code = result["files"]["code"]
+    assert any("keep.py" in f for f in code)   # graphify negation re-includes
+    assert not any("drop.py" in f for f in code)
 
 
 # Regression tests for #947 - .worktrees/ skipped and --exclude flag

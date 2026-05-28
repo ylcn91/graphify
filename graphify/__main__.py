@@ -1576,6 +1576,7 @@ def main() -> None:
         print("    --api-timeout S         per-request timeout in seconds for the LLM client (default: 600)")
         print("    --out DIR               output dir (default: <path>); writes <DIR>/graphify-out/")
         print("    --google-workspace      export .gdoc/.gsheet/.gslides shortcuts via gws before extraction")
+        print("    --skip-docs             extract only code files; skip docs/papers/images (code-only graph)")
         print("    --no-cluster            skip clustering, write raw extraction only")
         print("    --global                also merge the resulting graph into the global graph")
         print("    --as <tag>              repo tag for --global (default: target directory name)")
@@ -3266,7 +3267,7 @@ def main() -> None:
         if len(sys.argv) < 3:
             print(
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
-                "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
+                "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--skip-docs] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--api-timeout S]",
                 file=sys.stderr,
@@ -3285,6 +3286,7 @@ def main() -> None:
         no_cluster = False
         dedup_llm = False
         google_workspace = False
+        skip_docs = False
         global_merge = False
         global_repo_tag: str | None = None
         # Performance/tuning knobs (issue #792). None means "use library default".
@@ -3345,6 +3347,8 @@ def main() -> None:
                 dedup_llm = True; i += 1
             elif a == "--google-workspace":
                 google_workspace = True; i += 1
+            elif a == "--skip-docs":
+                skip_docs = True; i += 1
             elif a == "--global":
                 global_merge = True; i += 1
             elif a == "--as" and i + 1 < len(args):
@@ -3496,10 +3500,11 @@ def main() -> None:
                 manifest_path=str(manifest_path),
                 google_workspace=google_workspace or None,
                 extra_excludes=cli_excludes or None,
+                skip_docs=skip_docs,
             )
         else:
             print(f"[graphify extract] scanning {target}")
-            detection = _detect(target, google_workspace=google_workspace or None, extra_excludes=cli_excludes or None)
+            detection = _detect(target, google_workspace=google_workspace or None, extra_excludes=cli_excludes or None, skip_docs=skip_docs)
 
         files_by_type = detection.get("files", {})
         if incremental_mode:

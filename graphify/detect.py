@@ -619,11 +619,17 @@ def _find_vcs_root(start: Path) -> Path | None:
 
 
 def _load_graphifyignore(root: Path) -> list[tuple[Path, str]]:
-    """Read .graphifyignore files and return (anchor_dir, pattern) pairs.
+    """Read .gitignore + .graphifyignore files and return (anchor_dir, pattern) pairs.
+
+    Both files are honored in each directory (#1043/#189): the repo's existing
+    .gitignore (build/, node_modules/, dist/, .venv/, …) is respected so those
+    artifacts are not extracted, and .graphifyignore adds graphify-specific
+    rules on top.
 
     Patterns are returned outer-first so that inner (closer) rules are
     appended last and win via last-match-wins semantics — matching gitignore
-    behavior exactly.
+    behavior exactly. Within one directory, .gitignore is read before
+    .graphifyignore so graphify-specific rules win on conflict.
 
     Walk ceiling: the nearest VCS root if inside a repo, otherwise the scan
     root itself (hermetic — no leakage across unrelated sibling projects).
@@ -643,16 +649,19 @@ def _load_graphifyignore(root: Path) -> list[tuple[Path, str]]:
 
     patterns: list[tuple[Path, str]] = []
     for d in dirs:
-        # Prefer .graphifyignore; fall back to .gitignore so projects that already
-        # maintain a .gitignore get sensible defaults without duplicating it (#945).
-        ignore_file = d / ".graphifyignore"
-        if not ignore_file.exists():
-            ignore_file = d / ".gitignore"
-        if ignore_file.exists():
-            for raw in ignore_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = _parse_gitignore_line(raw)
-                if line:
-                    patterns.append((d, line))
+        # Load .gitignore first, then .graphifyignore in the same directory.
+        # Both apply (#1043/#189): a repo's existing .gitignore already lists
+        # build artifacts / node_modules / dist / .venv, and graphify should
+        # not extract those. Appending .graphifyignore last means graphify-
+        # specific rules win on conflict via last-match-wins — so a project can
+        # re-include (with !) something its .gitignore excludes, or vice versa.
+        for name in (".gitignore", ".graphifyignore"):
+            ignore_file = d / name
+            if ignore_file.exists():
+                for raw in ignore_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    line = _parse_gitignore_line(raw)
+                    if line:
+                        patterns.append((d, line))
     return patterns
 
 
@@ -862,7 +871,13 @@ def _auto_follow_symlinks(root: Path) -> bool:
     return False
 
 
-def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace: bool | None = None, extra_excludes: list[str] | None = None) -> dict:
+def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace: bool | None = None, extra_excludes: list[str] | None = None, skip_docs: bool = False) -> dict:
+    """Scan ``root`` and bucket files by :class:`FileType`.
+
+    ``skip_docs`` (#189): when True, only CODE files are collected; document,
+    paper, and image files are skipped entirely so a code-only graph can be
+    built without the LLM/semantic doc pass.
+    """
     root = root.resolve()
     if follow_symlinks is None:
         follow_symlinks = _auto_follow_symlinks(root)
@@ -950,6 +965,10 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
             continue
         ftype = classify_file(p)
         if ftype:
+            # --skip-docs: code-only graph. Drop doc/paper/image/video files
+            # (and skip their office/google-workspace conversion) entirely.
+            if skip_docs and ftype != FileType.CODE:
+                continue
             if p.suffix.lower() in GOOGLE_WORKSPACE_EXTENSIONS:
                 if not google_workspace:
                     skipped_sensitive.append(
@@ -1183,6 +1202,7 @@ def detect_incremental(
     google_workspace: bool | None = None,
     kind: str = "semantic",
     extra_excludes: list[str] | None = None,
+    skip_docs: bool = False,
 ) -> dict:
     """Like detect(), but returns only new or modified files since the last run.
 
@@ -1207,7 +1227,7 @@ def detect_incremental(
     incremental runs. ``None`` (default) means auto-detect: ``True`` when ``root``
     contains at least one direct symlinked child, ``False`` otherwise.
     """
-    full = detect(root, follow_symlinks=follow_symlinks, google_workspace=google_workspace, extra_excludes=extra_excludes)
+    full = detect(root, follow_symlinks=follow_symlinks, google_workspace=google_workspace, extra_excludes=extra_excludes, skip_docs=skip_docs)
     manifest = load_manifest(manifest_path)
 
     if not manifest:
