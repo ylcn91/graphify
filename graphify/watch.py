@@ -10,6 +10,71 @@ from pathlib import Path
 
 _GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
 
+# Name of the on-disk coalesce queue (see _append_pending / _drain_pending).
+_PENDING_FILE = ".rebuild.pending"
+# Sentinel line meaning "a full re-extraction was requested while the lock was
+# held" — drained as a full rebuild rather than an incremental change set.
+_PENDING_FULL = "*"
+# Bound the holder's drain loop so a steady stream of incoming commits cannot
+# pin one process rebuilding forever; leftover paths stay queued for the next
+# trigger.
+_MAX_DRAIN_ROUNDS = 8
+
+
+def _append_pending(out_dir: Path, changed_paths: "list[Path] | None") -> None:
+    """Record a rebuild request that lost the lock so it is not dropped (#1059).
+
+    Appends one line per changed path (or a single ``*`` sentinel for a full
+    rebuild) to ``.rebuild.pending``. Append mode is used so concurrent writers
+    from separate post-commit processes coalesce instead of clobbering each
+    other. The in-flight holder drains this file before releasing the lock.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pending = out_dir / _PENDING_FILE
+    if changed_paths is None:
+        lines = [_PENDING_FULL]
+    else:
+        lines = [str(p) for p in changed_paths]
+    if not lines:
+        return
+    with contextlib.suppress(OSError):
+        with open(pending, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+
+def _drain_pending(out_dir: Path) -> "tuple[bool, list[Path]]":
+    """Atomically consume the pending queue. Returns (full_requested, paths).
+
+    The file is renamed before reading so a writer appending after the drain
+    starts queues its paths for the *next* round rather than being lost in a
+    truncate race.
+    """
+    pending = out_dir / _PENDING_FILE
+    staging = out_dir / (_PENDING_FILE + ".draining")
+    try:
+        pending.rename(staging)
+    except OSError:
+        return (False, [])
+    try:
+        text = staging.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    with contextlib.suppress(OSError):
+        staging.unlink()
+    full = False
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        if line == _PENDING_FULL:
+            full = True
+        else:
+            paths.append(Path(line))
+    return (full, paths)
+
 
 @contextlib.contextmanager
 def _rebuild_lock(out_dir: Path, *, blocking: bool = False):
@@ -322,10 +387,36 @@ def _rebuild_code(
     if acquire_lock:
         with _rebuild_lock(out, blocking=block_on_lock) as got:
             if not got:
+                # Another rebuild holds the lock. Queue this trigger's changes
+                # so they are folded into the in-flight (or next) rebuild
+                # instead of being silently dropped (#1059).
+                _append_pending(out, changed_paths)
                 print("[graphify watch] Rebuild already in progress for "
-                      f"{watch_path.resolve()} - skipping.")
-                return False
-            return _rebuild_code(
+                      f"{watch_path.resolve()} - changes queued for coalescing.")
+                # Closes the race where we queued *after* the holder's final
+                # drain but *before* it released: block until the holder lets
+                # go, then drain the queue ourselves so our changes are not
+                # stranded until the next commit. If the holder already drained
+                # our paths, the queue is empty and this is a cheap no-op.
+                with _rebuild_lock(out, blocking=True) as retry_got:
+                    if not retry_got:
+                        return False
+                    drained = False
+                    for _ in range(_MAX_DRAIN_ROUNDS):
+                        full, queued = _drain_pending(out)
+                        if not full and not queued:
+                            break
+                        _rebuild_code(
+                            watch_path,
+                            changed_paths=None if full else queued,
+                            follow_symlinks=follow_symlinks,
+                            force=force,
+                            no_cluster=no_cluster,
+                            acquire_lock=False,
+                        )
+                        drained = True
+                    return drained
+            ok = _rebuild_code(
                 watch_path,
                 changed_paths=changed_paths,
                 follow_symlinks=follow_symlinks,
@@ -333,6 +424,23 @@ def _rebuild_code(
                 no_cluster=no_cluster,
                 acquire_lock=False,
             )
+            # Drain anything queued by contending triggers while we held the
+            # lock, looping until empty (bounded) so back-to-back commits all
+            # land. Still under the lock, so no other rebuild can race us.
+            for _ in range(_MAX_DRAIN_ROUNDS):
+                full, queued = _drain_pending(out)
+                if not full and not queued:
+                    break
+                _rebuild_code(
+                    watch_path,
+                    changed_paths=None if full else queued,
+                    follow_symlinks=follow_symlinks,
+                    force=force,
+                    no_cluster=no_cluster,
+                    acquire_lock=False,
+                )
+                ok = True
+            return ok
 
     watch_root = watch_path.resolve()
     project_root = Path.cwd().resolve() if not watch_path.is_absolute() else watch_root
