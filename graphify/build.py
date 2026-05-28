@@ -465,3 +465,147 @@ def prune_low_degree_nodes(graph_data: dict, min_degree: int) -> tuple[dict, int
         n for n in graph_data.get("nodes", []) if degree.get(n["id"], 0) >= min_degree
     ]
     return graph_data, before - len(graph_data["nodes"])
+
+
+def rename_node_in_graph(graph_data: dict, old_id: str, new_id: str) -> tuple[dict, int]:
+    """Rename a node's id and repoint every edge endpoint referencing it.
+
+    Operates on the raw graph.json dict (the ``links``/``edges`` form) so every
+    other node/edge field and the top-level schema (``directed``, ``community``,
+    ``norm_label``, ``hyperedges``, ``built_at_commit``, …) round-trips untouched
+    — mirrors ``prune_low_degree_nodes`` / ``export.prune_dangling_edges``.
+
+    Raises ``KeyError`` if ``old_id`` is absent, or if ``new_id`` already names a
+    different node (renaming would otherwise silently collide two distinct nodes;
+    use ``merge_nodes_in_graph`` for that). Returns the mutated dict and the
+    number of edge endpoints rewritten.
+    """
+    nodes = graph_data.get("nodes", [])
+    if not any(n.get("id") == old_id for n in nodes):
+        raise KeyError(f"node not found: {old_id}")
+    if old_id != new_id and any(n.get("id") == new_id for n in nodes):
+        raise KeyError(f"node already exists: {new_id}")
+    if old_id == new_id:
+        return graph_data, 0
+    for n in nodes:
+        if n.get("id") == old_id:
+            n["id"] = new_id
+    links_key = "links" if "links" in graph_data else "edges"
+    rewired = 0
+    for e in graph_data.get(links_key, []):
+        if e.get("source") == old_id:
+            e["source"] = new_id
+            rewired += 1
+        if e.get("target") == old_id:
+            e["target"] = new_id
+            rewired += 1
+    return graph_data, rewired
+
+
+def merge_nodes_in_graph(graph_data: dict, from_id: str, into_id: str) -> tuple[dict, int, int]:
+    """Merge node ``from_id`` into ``into_id``: rewire edges, drop ``from_id``.
+
+    Attribute policy: ``into_id`` wins — its node attributes are kept verbatim and
+    ``from_id``'s attributes are discarded (no field merging). ``from_id``'s edges
+    are repointed to ``into_id``; any edge that would become a self-loop on
+    ``into_id`` (e.g. an existing ``from_id``->``into_id`` edge) is dropped, and
+    edges that become duplicates of an already-present (source, target, relation)
+    triple after rewiring are also dropped.
+
+    Operates on the raw dict so schema round-trips untouched. Raises ``KeyError``
+    if either id is absent. Returns the mutated dict, the count of edges rewired
+    (endpoints repointed), and the count of edges dropped (self-loops + dupes).
+    """
+    nodes = graph_data.get("nodes", [])
+    if not any(n.get("id") == from_id for n in nodes):
+        raise KeyError(f"node not found: {from_id}")
+    if not any(n.get("id") == into_id for n in nodes):
+        raise KeyError(f"node not found: {into_id}")
+    if from_id == into_id:
+        return graph_data, 0, 0
+
+    graph_data["nodes"] = [n for n in nodes if n.get("id") != from_id]
+
+    links_key = "links" if "links" in graph_data else "edges"
+    rewired = 0
+    dropped = 0
+    seen: set[tuple] = set()
+    kept: list[dict] = []
+    for e in graph_data.get(links_key, []):
+        src, tgt = e.get("source"), e.get("target")
+        if src == from_id:
+            e["source"] = into_id
+            rewired += 1
+        if tgt == from_id:
+            e["target"] = into_id
+            rewired += 1
+        if e.get("source") == e.get("target"):
+            dropped += 1
+            continue
+        key = (e.get("source"), e.get("target"), e.get("relation"))
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        kept.append(e)
+    graph_data[links_key] = kept
+    return graph_data, rewired, dropped
+
+
+def drop_edge_in_graph(
+    graph_data: dict, source_id: str, target_id: str, relation: str | None = None
+) -> tuple[dict, int]:
+    """Remove edges matching ``source_id`` -> ``target_id`` (optionally ``relation``).
+
+    When ``relation`` is None, every edge between the two endpoints is removed;
+    otherwise only edges whose ``relation`` matches are removed. Operates on the
+    raw dict so schema round-trips untouched. Raises ``KeyError`` if no matching
+    edge exists. Returns the mutated dict and the count of removed edges.
+    """
+    links_key = "links" if "links" in graph_data else "edges"
+    edges = graph_data.get(links_key, [])
+
+    def _matches(e: dict) -> bool:
+        if e.get("source") != source_id or e.get("target") != target_id:
+            return False
+        return relation is None or e.get("relation") == relation
+
+    removed = sum(1 for e in edges if _matches(e))
+    if removed == 0:
+        rel = f" relation={relation!r}" if relation is not None else ""
+        raise KeyError(f"edge not found: {source_id} -> {target_id}{rel}")
+    graph_data[links_key] = [e for e in edges if not _matches(e)]
+    return graph_data, removed
+
+
+def relabel_edge_in_graph(
+    graph_data: dict,
+    source_id: str,
+    target_id: str,
+    new_relation: str,
+    relation: str | None = None,
+) -> tuple[dict, int]:
+    """Change the ``relation`` of edges matching ``source_id`` -> ``target_id``.
+
+    When ``relation`` is given, only edges currently carrying that relation are
+    retargeted to ``new_relation``; otherwise every edge between the two endpoints
+    is retargeted. Operates on the raw dict so schema round-trips untouched.
+    Raises ``KeyError`` if no matching edge exists. Returns the mutated dict and
+    the count of relabeled edges.
+    """
+    links_key = "links" if "links" in graph_data else "edges"
+
+    def _matches(e: dict) -> bool:
+        if e.get("source") != source_id or e.get("target") != target_id:
+            return False
+        return relation is None or e.get("relation") == relation
+
+    relabeled = 0
+    for e in graph_data.get(links_key, []):
+        if _matches(e):
+            e["relation"] = new_relation
+            relabeled += 1
+    if relabeled == 0:
+        rel = f" relation={relation!r}" if relation is not None else ""
+        raise KeyError(f"edge not found: {source_id} -> {target_id}{rel}")
+    return graph_data, relabeled

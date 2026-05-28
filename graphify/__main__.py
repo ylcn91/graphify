@@ -1524,6 +1524,16 @@ def main() -> None:
         print("  prune [path]            drop low-degree (noise) nodes from graph.json and rewrite it")
         print("    --min-degree N          remove nodes with total degree (in+out) < N (default 1: drops isolated nodes)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        print("  rename-node <old> <new> change a node's id and rewrite every edge endpoint referencing it")
+        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        print("  merge-node <from> <into>  merge node <from> into <into> (rewire edges, drop <from>; <into> attrs win)")
+        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        print("  drop-edge <src> <tgt>   remove edge(s) between two nodes from graph.json")
+        print("    --relation R            only drop edges whose relation is R (default: all edges between src/tgt)")
+        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        print("  relabel-edge <src> <tgt> <new-relation>  change the relation of edge(s) between two nodes")
+        print("    --relation old          only relabel edges whose current relation is `old` (default: all)")
+        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
         print("    --context C             explicit edge-context filter (repeatable)")
@@ -2565,6 +2575,115 @@ def main() -> None:
         print(f"Pruned graph at {gp} (--min-degree {min_degree})")
         print(f"  nodes: {nodes_before} -> {nodes_after} ({removed_nodes} removed)")
         print(f"  edges: {edges_before} -> {edges_after} ({removed_edges} removed)")
+
+    elif cmd in ("rename-node", "merge-node", "drop-edge", "relabel-edge"):
+        # Graph hygiene: manual surgery on an existing graph.json without a full
+        # rebuild. Each op operates on the raw JSON dict (see the *_in_graph
+        # helpers in build.py) so the schema round-trips byte-faithfully — the
+        # same approach as `prune`. Args are parsed by a hand-rolled walk that
+        # mirrors `prune`: positional args in order, plus --graph / --relation.
+        positionals: list[str] = []
+        graph_path = _default_graph_path()
+        relation: str | None = None
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif args[i].startswith("--graph="):
+                graph_path = args[i].split("=", 1)[1]; i += 1
+            elif args[i] == "--relation" and i + 1 < len(args):
+                relation = args[i + 1]; i += 2
+            elif args[i].startswith("--relation="):
+                relation = args[i].split("=", 1)[1]; i += 1
+            elif args[i].startswith("--"):
+                i += 1
+            else:
+                positionals.append(args[i]); i += 1
+
+        # Required positional arity per op.
+        arity = {
+            "rename-node": 2,       # <old-id> <new-id>
+            "merge-node": 2,        # <from-id> <into-id>
+            "drop-edge": 2,         # <source-id> <target-id>
+            "relabel-edge": 3,      # <source-id> <target-id> <new-relation>
+        }[cmd]
+        # An optional trailing positional is the graph path (mirrors `prune`,
+        # which accepts the path as a bare positional). --graph still wins.
+        if len(positionals) == arity + 1 and graph_path == _default_graph_path():
+            graph_path = positionals.pop()
+        if len(positionals) != arity:
+            usage = {
+                "rename-node": "graphify rename-node <old-id> <new-id> [--graph path]",
+                "merge-node": "graphify merge-node <from-id> <into-id> [--graph path]",
+                "drop-edge": "graphify drop-edge <source-id> <target-id> [--relation R] [--graph path]",
+                "relabel-edge": "graphify relabel-edge <source-id> <target-id> <new-relation> [--relation old] [--graph path]",
+            }[cmd]
+            print(f"error: usage: {usage}", file=sys.stderr)
+            sys.exit(2)
+
+        gp = Path(graph_path).resolve()
+        if not gp.exists():
+            print(f"error: graph file not found: {gp}", file=sys.stderr)
+            sys.exit(1)
+        if not gp.suffix == ".json":
+            print("error: graph file must be a .json file", file=sys.stderr)
+            sys.exit(1)
+        _enforce_graph_size_cap_or_exit(gp)
+        try:
+            data = json.loads(gp.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"error: could not load graph: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        from graphify.build import (
+            rename_node_in_graph,
+            merge_nodes_in_graph,
+            drop_edge_in_graph,
+            relabel_edge_in_graph,
+        )
+        try:
+            if cmd == "rename-node":
+                old_id, new_id = positionals
+                data, rewired = rename_node_in_graph(data, old_id, new_id)
+                report = (
+                    f"Renamed node '{old_id}' -> '{new_id}' in {gp}\n"
+                    f"  edge endpoints rewritten: {rewired}"
+                )
+            elif cmd == "merge-node":
+                from_id, into_id = positionals
+                data, rewired, dropped = merge_nodes_in_graph(data, from_id, into_id)
+                report = (
+                    f"Merged node '{from_id}' into '{into_id}' in {gp}\n"
+                    f"  edge endpoints rewired: {rewired}\n"
+                    f"  edges dropped (self-loops/dupes): {dropped}"
+                )
+            elif cmd == "drop-edge":
+                source_id, target_id = positionals
+                data, removed = drop_edge_in_graph(data, source_id, target_id, relation)
+                rel = f" (relation '{relation}')" if relation is not None else ""
+                report = (
+                    f"Dropped edge '{source_id}' -> '{target_id}'{rel} in {gp}\n"
+                    f"  edges removed: {removed}"
+                )
+            else:  # relabel-edge
+                source_id, target_id, new_relation = positionals
+                data, relabeled = relabel_edge_in_graph(
+                    data, source_id, target_id, new_relation, relation
+                )
+                rel = f" (was '{relation}')" if relation is not None else ""
+                report = (
+                    f"Relabeled edge '{source_id}' -> '{target_id}'{rel} to "
+                    f"relation '{new_relation}' in {gp}\n"
+                    f"  edges relabeled: {relabeled}"
+                )
+        except KeyError as exc:
+            print(f"error: {exc.args[0] if exc.args else exc}", file=sys.stderr)
+            sys.exit(1)
+
+        with open(gp, "w", encoding="utf-8") as f:  # nosec
+            json.dump(data, f, indent=2)
+        print(report)
 
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
