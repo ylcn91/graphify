@@ -73,13 +73,92 @@ def _make_id(*parts: str) -> str:
     return cleaned.strip("_").casefold()
 
 
+def _path_without_ext(path: Path | str | None) -> str:
+    """Return the path string with its (single, trailing) file extension removed.
+
+    ``with_suffix("")`` strips only the last suffix, so ``index.tsx`` → ``index``
+    and ``foo.test.js`` → ``foo.test``. Extensionless paths pass through.
+
+    Accepts ``str``/``None`` as well as ``Path`` so import-resolution call sites
+    that hold a ``Path | None`` (resolver outputs that are provably non-None here
+    but the type system can't narrow) keep the same tolerance the prior
+    ``_make_id(str(...))`` form had.
+    """
+    p = Path(path) if path is not None else Path("None")
+    return str(p.with_suffix("")) if p.suffix else str(p)
+
+
+def canonical_file_id(path: Path | str, root: Path | str | None = None) -> str:
+    """Return the canonical node ID for a source file: the full repo-relative
+    path with the extension removed, normalized by :func:`_make_id`.
+
+    This is the single source of truth for file-node IDs AND the prefix of every
+    symbol ID that file emits (symbol id = ``f"{canonical_file_id}_{entity}"``).
+    Using the FULL relative path — not just one parent directory — keeps
+    same-basename files in different directories distinct (``a/util/x.py`` →
+    ``a_util_x`` vs ``b/util/x.py`` → ``b_util_x``) and drops the extension so a
+    file node and its symbols share one prefix (#952/#438/#1033).
+
+    The skill markdown files document this exact formula for semantic subagents;
+    the prose there MUST stay byte-identical to this implementation so AST and
+    semantic nodes for the same file merge instead of splitting into ghosts.
+
+    Examples (root-relative):
+        ``src/auth/session.py``            → ``src_auth_session``
+        ``app/components/Button/index.tsx``→ ``app_components_button_index``
+        ``setup.py``                       → ``setup``
+    """
+    p = Path(path)
+    if root is not None:
+        try:
+            p = p.resolve().relative_to(Path(root).resolve())
+        except (ValueError, OSError):
+            pass
+    return _make_id(_path_without_ext(p))
+
+
 def _file_stem(path: Path) -> str:
-    """Return a stem qualified with the parent directory name to avoid ID collisions
-    when multiple files share the same filename in different directories (#550)."""
+    """Return the per-file ID prefix used for symbol IDs.
+
+    This is the full path (extension removed) of the file AS PASSED to the
+    extractor. The extractor runs without knowing the repo root (its output is
+    cached per-file, keyed on path), so it emits root-independent IDs here; the
+    post-extraction remap in :func:`extract` rewrites these to the canonical
+    repo-relative form. The value mirrors :func:`canonical_file_id` modulo the
+    relativization step.
+
+    Previously this used only the immediate parent directory
+    (``{parent}.{stem}``), which collapsed same-basename files in different
+    directories onto one ID (#952/#438). The full path keeps them distinct.
+    """
+    return _path_without_ext(path)
+
+
+def _match_stem(path: Path) -> str:
+    """Return the parent-directory-qualified module stem used for IMPORT MATCHING.
+
+    This is NOT a node-ID prefix (that is :func:`_file_stem` / the canonical id).
+    Cross-file resolvers match an import's package prefix (``pkg_a.settings``)
+    against the defining file's parent-qualified stem so same-basename modules
+    disambiguate by the package the import names (#949). Returns ``{parent}.{stem}``
+    when there is a parent directory, else the bare stem.
+    """
     parent = path.parent.name
     if parent and parent not in (".", ""):
         return f"{parent}.{path.stem}"
     return path.stem
+
+
+def _file_node_id(path: Path) -> str:
+    """Return the file node ID for the path AS PASSED to the extractor.
+
+    Identical to ``_make_id(_file_stem(path))`` so the file node and every symbol
+    that file emits share one prefix. The extension is dropped (#1033) — the old
+    scheme kept it (``…_py``), which split a file node from its own symbols. Like
+    :func:`_file_stem`, this is root-independent; :func:`extract` remaps it to the
+    canonical repo-relative form afterward.
+    """
+    return _make_id(_path_without_ext(path))
 
 
 _TSCONFIG_ALIAS_CACHE: dict[str, dict[str, str]] = {}
@@ -736,7 +815,7 @@ def _import_python(node, source: bytes, file_nid: str, stem: str, edges: list, s
                 for _ in range(dots - 1):
                     base = base.parent
                 rel = (module_name.replace(".", "/") + ".py") if module_name else "__init__.py"
-                tgt_nid = _make_id(str(base / rel))
+                tgt_nid = _make_id(_path_without_ext(base / rel))
             else:
                 tgt_nid = _make_id(raw)
             edges.append({
@@ -762,7 +841,7 @@ def _resolve_js_import_target(raw: str, str_path: str) -> "tuple[str, Path | Non
         return None
     resolved_path = _resolve_js_module_path(raw, Path(str_path).parent)
     if resolved_path is not None:
-        return _make_id(str(resolved_path)), resolved_path
+        return _make_id(_path_without_ext(resolved_path)), resolved_path
     module_name = raw.split("/")[-1]
     if not module_name:
         return None
@@ -980,7 +1059,7 @@ def _import_c(node, source: bytes, file_nid: str, stem: str, edges: list, str_pa
             if child.type != "system_lib_string":
                 resolved = _resolve_c_include_path(raw, str_path)
                 if resolved is not None:
-                    tgt_nid = _make_id(str(resolved))
+                    tgt_nid = _make_id(_path_without_ext(resolved))
                     edges.append({
                         "source": file_nid,
                         "target": tgt_nid,
@@ -1708,7 +1787,7 @@ def _extract_generic(path: Path, config: LanguageConfig) -> dict:
             add_node(nid, name, line)
         return nid
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     def walk(node, parent_class_nid: str | None = None) -> None:
@@ -2564,7 +2643,7 @@ def _extract_python_rationale(path: Path, result: dict) -> None:
     nodes = result["nodes"]
     edges = result["edges"]
     seen_ids = {n["id"] for n in nodes}
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
 
     def _get_docstring(body_node) -> tuple[str, int] | None:
         if not body_node:
@@ -2682,9 +2761,10 @@ def extract_svelte(path: Path) -> dict:
         src = path.read_text(encoding="utf-8", errors="replace")
         existing_ids = {n["id"] for n in result.get("nodes", [])}
         # Source file node ID must match the one _extract_generic creates:
-        # _make_id(str(path)) - single arg, no stem prefix. Otherwise the source
-        # endpoint is a phantom node and build_from_json drops the edge (#701).
-        file_node_id = _make_id(str(path))
+        # _file_node_id(path) - the path-without-extension, no stem prefix.
+        # Otherwise the source endpoint is a phantom node and build_from_json
+        # drops the edge (#701).
+        file_node_id = _file_node_id(path)
         aliases = _load_tsconfig_aliases(path.parent)
         for m in _re.finditer(r"""import\(\s*['"]([^'"]+)['"]\s*\)""", src):
             raw = m.group(1)
@@ -2697,7 +2777,7 @@ def extract_svelte(path: Path) -> dict:
                 # imports of bare paths and .svelte.ts rune files land on real
                 # file nodes instead of phantom ids (#716).
                 resolved = _resolve_js_module_path(resolved)
-                node_id = _make_id(str(resolved))
+                node_id = _make_id(_path_without_ext(resolved))
                 stub_source_file = str(resolved)
             else:
                 # Check tsconfig.json path aliases (e.g. "$lib/" -> "src/lib/", "@/" -> "src/")
@@ -2711,7 +2791,7 @@ def extract_svelte(path: Path) -> dict:
                         break
                 if resolved_alias is not None:
                     resolved_alias = _resolve_js_module_path(resolved_alias)
-                    node_id = _make_id(str(resolved_alias))
+                    node_id = _make_id(_path_without_ext(resolved_alias))
                     stub_source_file = str(resolved_alias)
                 else:
                     # Bare/scoped import (node_modules) - use last segment;
@@ -2763,7 +2843,7 @@ def extract_svelte(path: Path) -> dict:
                         resolved = resolved.with_suffix(".ts")
                     elif resolved.suffix == ".jsx":
                         resolved = resolved.with_suffix(".tsx")
-                    node_id = _make_id(str(resolved))
+                    node_id = _make_id(_path_without_ext(resolved))
                     stub_source_file = str(resolved)
                 else:
                     resolved_alias = None
@@ -2773,7 +2853,7 @@ def extract_svelte(path: Path) -> dict:
                             resolved_alias = Path(os.path.normpath(Path(alias_base) / rest))
                             break
                     if resolved_alias is not None:
-                        node_id = _make_id(str(resolved_alias))
+                        node_id = _make_id(_path_without_ext(resolved_alias))
                         stub_source_file = str(resolved_alias)
                     else:
                         module_name = raw.split("/")[-1]
@@ -2822,7 +2902,7 @@ def extract_astro(path: Path) -> dict:
         import re as _re
         src = path.read_text(encoding="utf-8", errors="replace")
         existing_ids = {n["id"] for n in result.get("nodes", [])}
-        file_node_id = _make_id(str(path))
+        file_node_id = _file_node_id(path)
         aliases = _load_tsconfig_aliases(path.parent)
         # Dynamic imports anywhere in the file: `import('./X.astro')` is legal in
         # frontmatter setup code and inside expression slots.
@@ -2833,7 +2913,7 @@ def extract_astro(path: Path) -> dict:
             if raw.startswith("."):
                 resolved = Path(os.path.normpath(path.parent / raw))
                 resolved = _resolve_js_module_path(resolved)
-                node_id = _make_id(str(resolved))
+                node_id = _make_id(_path_without_ext(resolved))
                 stub_source_file = str(resolved)
             else:
                 resolved_alias = None
@@ -2844,7 +2924,7 @@ def extract_astro(path: Path) -> dict:
                         break
                 if resolved_alias is not None:
                     resolved_alias = _resolve_js_module_path(resolved_alias)
-                    node_id = _make_id(str(resolved_alias))
+                    node_id = _make_id(_path_without_ext(resolved_alias))
                     stub_source_file = str(resolved_alias)
                 else:
                     module_name = raw.split("/")[-1]
@@ -2899,7 +2979,7 @@ def extract_astro(path: Path) -> dict:
                         resolved = resolved.with_suffix(".ts")
                     elif resolved.suffix == ".jsx":
                         resolved = resolved.with_suffix(".tsx")
-                    node_id = _make_id(str(resolved))
+                    node_id = _make_id(_path_without_ext(resolved))
                     stub_source_file = str(resolved)
                 else:
                     resolved_alias = None
@@ -2909,7 +2989,7 @@ def extract_astro(path: Path) -> dict:
                             resolved_alias = Path(os.path.normpath(Path(alias_base) / rest))
                             break
                     if resolved_alias is not None:
-                        node_id = _make_id(str(resolved_alias))
+                        node_id = _make_id(_path_without_ext(resolved_alias))
                         stub_source_file = str(resolved_alias)
                     else:
                         module_name = raw.split("/")[-1]
@@ -3009,7 +3089,7 @@ def _extract_spock_fallback(path: Path, ts_result: dict) -> dict:
     plain_method_re = _re.compile(r"""^\s*def\s+(\w+)\s*\(""")
 
     current_class_nid: str | None = None
-    file_nid = _make_id(str_path)
+    file_nid = _file_node_id(path)
 
     # Ensure the file node exists (tree-sitter pass may have emitted it)
     if file_nid not in seen_ids:
@@ -3104,7 +3184,7 @@ def extract_blade(path: Path) -> dict:
     except OSError:
         return {"error": f"cannot read {path}"}
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     nodes = [{"id": file_nid, "label": path.name, "file_type": "code",
               "source_file": str(path), "source_location": None}]
     edges = []
@@ -3152,7 +3232,7 @@ def extract_dart(path: Path) -> dict:
 
     # Use stem (not str(path)) for child IDs to keep them machine-independent.
     stem = _file_stem(path)
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     nodes = [{"id": file_nid, "label": path.name, "file_type": "code",
               "source_file": str(path), "source_location": None}]
     edges = []
@@ -3234,7 +3314,7 @@ def extract_verilog(path: Path) -> dict:
                       "confidence": confidence, "confidence_score": score,
                       "source_file": str_path, "source_location": f"L{line}", "weight": 1.0})
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     def walk(node, module_nid: str | None = None) -> None:
@@ -3321,7 +3401,7 @@ def extract_sql(path: Path) -> dict:
 
     stem = _file_stem(path)
     str_path = str(path)
-    file_nid = _make_id(str_path)
+    file_nid = _file_node_id(path)
     nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
                            "source_file": str_path, "source_location": None}]
     edges: list[dict] = []
@@ -3629,7 +3709,7 @@ def extract_julia(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     def _func_name_from_signature(sig_node) -> str | None:
@@ -3881,7 +3961,7 @@ def extract_fortran(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     def _fortran_name(stmt_node) -> str | None:
@@ -4053,7 +4133,7 @@ def extract_go(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     def walk(node) -> None:
@@ -4281,7 +4361,7 @@ def extract_rust(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     def walk(node, parent_impl_nid: str | None = None) -> None:
@@ -4460,7 +4540,7 @@ def extract_zig(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     def _extract_import(node) -> None:
@@ -4630,7 +4710,7 @@ def extract_powershell(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     _PS_SKIP = frozenset({
@@ -4983,7 +5063,7 @@ def _apply_symbol_resolution_facts(
         return
 
     path_by_resolved = {path.resolve(): path for path in paths}
-    source_file_id = {path.resolve(): _make_id(str(path)) for path in paths}
+    source_file_id = {path.resolve(): _file_node_id(path) for path in paths}
     symbol_nodes: dict[tuple[Path, str], str] = {}
     for node in nodes:
         source_path = _js_source_path(str(node.get("source_file", "")), root)
@@ -5074,7 +5154,7 @@ def _apply_symbol_resolution_facts(
         if source_id is not None:
             add_edge(
                 source_id,
-                _make_id(str(path_by_resolved.get(target_path, target_path))),
+                _make_id(_path_without_ext(path_by_resolved.get(target_path, target_path))),
                 "re_exports",
                 "export",
                 star_fact.line,
@@ -5098,7 +5178,7 @@ def _apply_symbol_resolution_facts(
             if source_id is not None:
                 add_edge(
                     source_id,
-                    _make_id(str(path_by_resolved.get(origin[0], origin[0]))),
+                    _make_id(_path_without_ext(path_by_resolved.get(origin[0], origin[0]))),
                     "re_exports",
                     "export",
                     export_fact.line,
@@ -5855,7 +5935,7 @@ def _resolve_cross_file_imports(
             if not src:
                 continue
             src_path = Path(src)
-            fq_stem = _file_stem(src_path)
+            fq_stem = _match_stem(src_path)
             label = node.get("label", "")
             nid = node.get("id", "")
             # Index class-level entities only. Function/method labels end in "()"
@@ -5875,9 +5955,10 @@ def _resolve_cross_file_imports(
 
     # Pass 2: for each file, find `from .X import A, B, C` and resolve
     new_edges: list[dict] = []
-    stem_to_path: dict[str, Path] = {_file_stem(p): p for p in paths}
 
     for file_result, path in zip(per_file, paths):
+        # _file_stem(path) is the node-ID prefix; _make_id(stem) is this file's
+        # file-level node id (excluded from importer candidates below).
         stem = _file_stem(path)
         str_path = str(path)
 
@@ -5923,9 +6004,11 @@ def _resolve_cross_file_imports(
                             if sub.type == "dotted_name":
                                 raw = source[sub.start_byte:sub.end_byte].decode("utf-8", errors="replace")
                                 bare = raw.split(".")[-1]
-                                # Resolve relative import to exact qualified stem.
+                                # Resolve relative import to exact qualified stem
+                                # (parent.stem) — the import-matching key, not the
+                                # node-id prefix.
                                 candidate = path.parent / f"{bare}.py"
-                                target_fq = _file_stem(candidate)
+                                target_fq = _match_stem(candidate)
                                 break
                         break
                     if child.type == "dotted_name" and target_fq is None:
@@ -6096,7 +6179,7 @@ def _resolve_cross_file_java_imports(
     new_edges: list[dict] = []
     seen_pairs: set[tuple[str, str]] = set()
     for path in paths:
-        file_nid = _make_id(str(path))
+        file_nid = _file_node_id(path)
         try:
             source = path.read_bytes()
             tree = parser.parse(source)
@@ -6183,7 +6266,7 @@ def extract_objc(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     def _read(node) -> str:
@@ -6385,7 +6468,7 @@ def extract_elixir(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     _IMPORT_KEYWORDS = frozenset({"alias", "import", "require", "use"})
@@ -6577,7 +6660,7 @@ def extract_markdown(path: Path) -> dict:
                       "confidence": confidence, "source_file": str_path,
                       "source_location": f"L{line}", "weight": weight})
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     # Track heading stack for nesting: [(level, nid), ...]
@@ -6687,7 +6770,7 @@ def _pascal_resolve_unit(from_path: Path, unit_name: str) -> str:
     """Resolve a Pascal unit name to the graphify node ID of its source file.
 
     Scans all Pascal files under the project root (the highest ancestor that
-    directly contains .pas/.dpr files) and returns _make_id(str(matched_path)).
+    directly contains .pas/.dpr files) and returns _file_node_id(matched_path).
     Result is cached per project root so the rglob runs at most once per
     project.  Falls back to _make_id(unit_name) for units not found on disk
     (e.g. standard RTL units like SysUtils, Windows).
@@ -6698,7 +6781,7 @@ def _pascal_resolve_unit(from_path: Path, unit_name: str) -> str:
         unit_map: dict[str, str] = {}
         for ext in (".pas", ".pp", ".dpr", ".dpk", ".inc"):
             for f in root.rglob("*" + ext):
-                unit_map[f.stem.lower()] = _make_id(str(f))
+                unit_map[f.stem.lower()] = _file_node_id(f)
         _pascal_unit_cache[root_key] = unit_map
     return _pascal_unit_cache[root_key].get(unit_name.lower(), _make_id(unit_name))
 
@@ -6915,7 +6998,7 @@ def _extract_pascal_regex(path: Path) -> dict:
     def _lineno(text: str, offset: int) -> int:
         return text.count("\n", 0, offset) + 1
 
-    file_nid = _make_id(str_path)
+    file_nid = _file_node_id(path)
     _add_node(file_nid, path.name, 1)
 
     stripped = _pascal_strip_comments(raw)
@@ -7090,7 +7173,7 @@ def extract_pascal(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
     module_nid = file_nid
 
@@ -7313,7 +7396,7 @@ def extract_lazarus_form(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     obj_re = re.compile(r"^\s*object\s+\w+\s*:\s*(\w+)", re.IGNORECASE)
@@ -7413,7 +7496,7 @@ def extract_delphi_form(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     obj_re   = re.compile(r"^\s*object\s+\w+\s*:\s*(\w+)", re.IGNORECASE)
@@ -7525,7 +7608,7 @@ def extract_lazarus_package(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name)
 
     name_elem = xml_root.find(".//Package/Name")
@@ -7624,7 +7707,7 @@ def extract_bash(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     # file_nid is fully path-derived and never produced by _make_id(stem, func_name),
     # so appending "__entry" guarantees a distinct ID from any function node.
     entry_nid = file_nid + "__entry"
@@ -7747,7 +7830,7 @@ def extract_bash(path: Path) -> dict:
                             # like `source ../../etc/passwd` that traverse outside
                             # the project tree (B-1).
                             if resolved.exists():
-                                tgt_nid = _make_id(str(resolved))
+                                tgt_nid = _make_id(_path_without_ext(resolved))
                                 add_edge(file_nid, tgt_nid, "imports_from", line,
                                          context="import")
                         else:
@@ -7810,7 +7893,7 @@ def extract_sln(path: Path) -> dict:
     except OSError:
         return {"nodes": [], "edges": [], "error": f"cannot read {path}"}
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     str_path = str(path)
     nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
                           "source_file": str_path, "source_location": None}]
@@ -7897,7 +7980,7 @@ def extract_csproj(path: Path) -> dict:
     except ET.ParseError as e:
         return {"nodes": [], "edges": [], "error": f"XML parse error: {e}"}
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     str_path = str(path)
     nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
                           "source_file": str_path, "source_location": None}]
@@ -7998,7 +8081,7 @@ def extract_razor(path: Path) -> dict:
     except OSError:
         return {"nodes": [], "edges": [], "error": f"cannot read {path}"}
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     str_path = str(path)
     nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
                           "source_file": str_path, "source_location": None}]
@@ -8157,7 +8240,7 @@ def extract_json(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     def _key_text(pair_node) -> str | None:
@@ -8293,7 +8376,7 @@ def extract_dm(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     add_node(file_nid, path.name, 1)
 
     def _type_path_text(node) -> str:
@@ -8334,7 +8417,7 @@ def extract_dm(path: Path) -> dict:
                 resolved = (path.parent / norm).resolve()
                 edge: dict = {
                     "source": file_nid,
-                    "target": _make_id(str(resolved)) if resolved.exists() else _make_id(norm),
+                    "target": _make_id(_path_without_ext(resolved)) if resolved.exists() else _make_id(norm),
                     "relation": "imports_from" if resolved.exists() else "imports",
                     "context": "import",
                     "confidence": "EXTRACTED",
@@ -8532,7 +8615,7 @@ def extract_dmi(path: Path) -> dict:
 
     str_path = str(path)
     stem = _file_stem(path)
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
                            "source_file": str_path, "source_location": "L1"}]
     edges: list[dict] = []
@@ -8631,7 +8714,7 @@ def extract_dmm(path: Path) -> dict:
         return {"nodes": [], "edges": [], "error": str(e)}
 
     str_path = str(path)
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
                            "source_file": str_path, "source_location": "L1"}]
     edges: list[dict] = []
@@ -8704,7 +8787,7 @@ def extract_dmf(path: Path) -> dict:
 
     str_path = str(path)
     stem = _file_stem(path)
-    file_nid = _make_id(str(path))
+    file_nid = _file_node_id(path)
     nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
                            "source_file": str_path, "source_location": "L1"}]
     edges: list[dict] = []
@@ -8825,7 +8908,7 @@ def extract_gdscript(path: Path) -> dict:
     def _lineno(offset: int) -> int:
         return raw.count("\n", 0, offset) + 1
 
-    file_nid = _make_id(str_path)
+    file_nid = _file_node_id(path)
     _add_node(file_nid, path.name, 1)
 
     # Script class node: explicit `class_name`, else the file stem.
@@ -9253,26 +9336,43 @@ def extract(
 
     _augment_symbol_resolution_edges(paths, all_nodes, all_edges, root)
 
-    # Remap file node IDs from absolute-path-derived to project-relative so
-    # graph.json edge endpoints are stable across machines (#502)
-    id_remap: dict[str, str] = {}
+    # Remap node IDs from the extractor's root-independent form to the canonical
+    # repo-relative form (#502/#952). Each extractor emits IDs derived from the
+    # path AS PASSED (which may be absolute): the file node id is
+    # ``_file_node_id(path)`` and every symbol id is ``{_file_node_id(path)}_…``.
+    # Here we rewrite that per-file PREFIX to ``canonical_file_id(path, root)`` so
+    # both the file node and all its symbols land on stable, collision-free IDs.
+    # We must rewrite the prefix (not just the exact file id) because symbols
+    # embed it, and we must apply the LONGEST matching prefix first so a file
+    # ``a/util/x.py`` (prefix ``a_util_x``) does not steal symbols belonging to a
+    # sibling file ``a/util/x_helper.py`` (prefix ``a_util_x_helper``).
+    prefix_remap: list[tuple[str, str]] = []
     for path in paths:
-        old_id = _make_id(str(path))
-        try:
-            new_id = _make_id(str(path.relative_to(root)))
-        except ValueError:
-            continue
-        if old_id != new_id:
-            id_remap[old_id] = new_id
-    if id_remap:
+        old_prefix = _file_node_id(path)
+        new_prefix = canonical_file_id(path, root)
+        if old_prefix and old_prefix != new_prefix:
+            prefix_remap.append((old_prefix, new_prefix))
+    # Longest old_prefix first so nested prefixes resolve unambiguously.
+    prefix_remap.sort(key=lambda pair: len(pair[0]), reverse=True)
+
+    def _remap_id(nid: str | None) -> str | None:
+        if not nid:
+            return nid
+        for old_prefix, new_prefix in prefix_remap:
+            if nid == old_prefix:
+                return new_prefix
+            if nid.startswith(old_prefix + "_"):
+                return new_prefix + nid[len(old_prefix):]
+        return nid
+
+    if prefix_remap:
         for n in all_nodes:
-            if n.get("id") in id_remap:
-                n["id"] = id_remap[n["id"]]
+            n["id"] = _remap_id(n.get("id"))
         for e in all_edges:
-            if e.get("source") in id_remap:
-                e["source"] = id_remap[e["source"]]
-            if e.get("target") in id_remap:
-                e["target"] = id_remap[e["target"]]
+            e["source"] = _remap_id(e.get("source"))
+            e["target"] = _remap_id(e.get("target"))
+        for rc in all_raw_calls:
+            rc["caller_nid"] = _remap_id(rc.get("caller_nid"))
 
     _merge_swift_extensions(per_file, all_nodes, all_edges)
     _disambiguate_colliding_node_ids(all_nodes, all_edges, all_raw_calls, root)
@@ -9345,7 +9445,7 @@ def extract(
             sf_rel = sf_path.relative_to(root) if sf_path.is_absolute() else sf_path
         except ValueError:
             sf_rel = sf_path
-        nid_to_file_nid[n["id"]] = _make_id(str(sf_rel))
+        nid_to_file_nid[n["id"]] = _make_id(_path_without_ext(sf_rel))
 
     existing_pairs = {(e["source"], e["target"]) for e in all_edges}
     for rc in all_raw_calls:

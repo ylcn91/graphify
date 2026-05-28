@@ -650,11 +650,21 @@ def test_extract_bash_no_dangling_edges():
 
 
 def test_extract_bash_skip_builtins_in_calls():
+    from graphify.extract import _file_node_id
+
     result = extract_bash(FIXTURES / "sample.sh")
     builtins = {"echo", "cd", "set", "export", "local", "mkdir", "if", "then"}
-    call_targets = {e["target"] for e in result["edges"] if e["relation"] == "calls"}
+    # Node ids embed the file path (#952); strip the file-id prefix so we test
+    # the call ENTITY against builtins rather than matching path substrings such
+    # as "if" inside ".../graphify/...".
+    prefix = _file_node_id(FIXTURES / "sample.sh") + "_"
+    call_entities = {
+        e["target"][len(prefix):] if e["target"].startswith(prefix) else e["target"]
+        for e in result["edges"]
+        if e["relation"] == "calls"
+    }
     for b in builtins:
-        assert not any(b in t for t in call_targets), f"Builtin '{b}' appeared as calls target"
+        assert b not in call_entities, f"Builtin '{b}' appeared as calls target"
 
 
 def test_extract_bash_missing_grammar_returns_error():
@@ -1025,21 +1035,29 @@ def test_pure_export_no_from_not_treated_as_reexport():
 
 
 def test_dart_child_node_ids_are_stem_based(tmp_path):
-    """Dart child node IDs must be built from _file_stem rather than absolute path."""
-    from graphify.extract import extract_dart, _file_stem, _make_id
+    """Dart child node IDs must share the file node's stem prefix (#952).
+
+    Run through the full ``extract()`` so the post-extraction remap relativizes
+    the absolute extractor path to the canonical repo-relative id; child symbol
+    ids then carry the canonical file id as their prefix.
+    """
+    from graphify.extract import extract, canonical_file_id, _make_id
 
     src_file = tmp_path / "mydir" / "sample.dart"
     src_file.parent.mkdir(parents=True, exist_ok=True)
     src_file.write_bytes(b"class MyClass {}\nvoid myFunc() {}\n")
 
-    result = extract_dart(src_file)
+    result = extract([src_file], cache_root=tmp_path)
 
-    stem = _file_stem(src_file)  # -> "mydir.sample"
-    expected_class_nid = _make_id(stem, "MyClass")   # -> "mydir_sample_myclass"
-    expected_func_nid  = _make_id(stem, "myFunc")    # -> "mydir_sample_myfunc"
+    file_id = canonical_file_id(src_file, tmp_path)  # -> "mydir_sample"
+    expected_class_nid = _make_id(file_id, "MyClass")  # -> "mydir_sample_myclass"
+    expected_func_nid = _make_id(file_id, "myFunc")    # -> "mydir_sample_myfunc"
 
     node_ids = {n["id"] for n in result["nodes"]}
 
+    assert file_id in node_ids, (
+        f"File node ID '{file_id}' not found in {node_ids}."
+    )
     assert expected_class_nid in node_ids, (
         f"Class node ID '{expected_class_nid}' not found in {node_ids}. "
         "extract_dart may still be using str(path) instead of _file_stem(path)."
@@ -1049,14 +1067,17 @@ def test_dart_child_node_ids_are_stem_based(tmp_path):
         "extract_dart may still be using str(path) instead of _file_stem(path)."
     )
 
-    # Sanity-check: no child node ID should contain any path separator fragment.
-    file_nid = next(n["id"] for n in result["nodes"] if n.get("label") == src_file.name)
+    # Sanity-check: every child node ID is prefixed by the canonical file id and
+    # carries no absolute-path fragment (the remap stripped it).
     for node in result["nodes"]:
-        if node["id"] == file_nid:
+        if node["id"] == file_id:
             continue
-        assert "_" + stem.replace(".", "_") in node["id"] or node["id"].startswith(stem.replace(".", "_")), (
-            f"Child node ID '{node['id']}' does not start with the expected stem prefix '{stem}'. "
-            "This suggests an absolute path is still leaking into the ID."
+        assert node["id"].startswith(file_id + "_"), (
+            f"Child node ID '{node['id']}' does not start with the canonical "
+            f"file-id prefix '{file_id}_'. An absolute path may be leaking in."
+        )
+        assert "private" not in node["id"] and "var_folders" not in node["id"], (
+            f"Child node ID '{node['id']}' contains an absolute-path fragment."
         )
 
 

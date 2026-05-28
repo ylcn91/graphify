@@ -13,6 +13,20 @@ from pathlib import Path
 # absolute path ("/shared/graphify-out").
 _GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
 
+# Node-ID scheme version. Mixed into every cache key so that when the ID format
+# changes, stale entries written under the previous scheme become unreachable
+# and the affected files are re-extracted under the new scheme. Without this, an
+# upgrade would silently serve old-scheme node IDs out of cache and produce a
+# half-old/half-new graph. Bump whenever extract.canonical_file_id / _make_id /
+# the symbol-ID layout changes. v2: full-repo-relative-path file IDs that drop
+# the extension and prefix every symbol ID (#952/#438/#1033).
+_CACHE_SCHEME_VERSION = "2"
+
+# Sentinel key under which the scheme version is recorded in the stat-index file.
+# Real entries are keyed by absolute file path, so this prefixed key never
+# collides with one.
+_SCHEME_KEY = "__graphify_scheme__"
+
 
 def _body_content(content: bytes) -> bytes:
     """Strip YAML frontmatter from Markdown content, returning only the body."""
@@ -131,13 +145,22 @@ def _ensure_stat_index(root: Path) -> None:
         return
     _stat_index_root = Path(root).resolve()
     p = _stat_index_file(_stat_index_root)
+    fresh: dict[str, dict] = {_SCHEME_KEY: {"v": _CACHE_SCHEME_VERSION}}
     if p.exists():
         try:
-            _stat_index = json.loads(p.read_text(encoding="utf-8"))
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            # Discard the fastpath when it was written for a different ID scheme:
+            # its cached digests point at stale-scheme cache entries (#952).
+            scheme = loaded.get(_SCHEME_KEY, {}) if isinstance(loaded, dict) else {}
+            if isinstance(scheme, dict) and scheme.get("v") == _CACHE_SCHEME_VERSION:
+                _stat_index = loaded
+            else:
+                _stat_index = fresh
+                _stat_index_dirty = True
         except (json.JSONDecodeError, OSError):
-            _stat_index = {}
+            _stat_index = fresh
     else:
-        _stat_index = {}
+        _stat_index = fresh
     atexit.register(_flush_stat_index)
 
 
@@ -221,6 +244,10 @@ def file_hash(path: Path, root: Path = Path(".")) -> str:
         h.update(rel.as_posix().lower().encode())
     except ValueError:
         h.update(p.resolve().as_posix().lower().encode())
+    # Mix in the node-ID scheme version so a scheme change invalidates the cache
+    # key, preventing old-scheme node IDs from being served out of cache (#952).
+    h.update(b"\x00")
+    h.update(_CACHE_SCHEME_VERSION.encode())
     digest = h.hexdigest()
 
     if st is not None:

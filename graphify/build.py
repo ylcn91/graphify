@@ -104,6 +104,52 @@ def edge_datas(G: nx.Graph, u: str, v: str) -> list[dict]:
     return [raw]
 
 
+def _path_without_ext(p: str) -> str:
+    """Return path string with a single trailing file extension removed."""
+    pp = Path(p)
+    return str(pp.with_suffix("")) if pp.suffix else str(pp)
+
+
+def _warn_if_legacy_id_scheme(nodes: list[dict]) -> None:
+    """Loudly warn when a loaded graph still uses the pre-#952 node-ID scheme.
+
+    Before #952, file node IDs kept the file extension (``src_auth_session_py``)
+    and symbol IDs were prefixed with only one parent directory. Those IDs cannot
+    be remapped to the canonical full-path scheme without reconstructing the
+    original path, so mixing such a graph with a freshly extracted one would
+    silently split every affected file into old-scheme and new-scheme ghosts.
+
+    Rather than guess, detect the mismatch — a file node whose ID equals the
+    extension-bearing normalisation of its ``source_file`` but NOT the
+    extension-stripped one — and tell the user to rebuild with
+    ``graphify extract --force``. Detection is cheap and bails after the first
+    hit so large graphs aren't fully scanned.
+    """
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        nid = node.get("id")
+        sf = node.get("source_file")
+        if not nid or not sf or node.get("file_type") != "code":
+            continue
+        sf_str = str(sf).replace("\\", "/")
+        with_ext = _normalize_id(sf_str)
+        no_ext = _normalize_id(_path_without_ext(sf_str))
+        if with_ext == no_ext:
+            continue  # extensionless source_file — nothing to distinguish
+        # Old scheme: a file node whose id carried the extension.
+        if nid == with_ext and nid != no_ext:
+            print(
+                "[graphify] WARNING: this graph uses the pre-#952 node-ID scheme "
+                "(file IDs keep the extension, e.g. '" + with_ext + "'). New "
+                "extractions use the extension-stripped full-path scheme ('"
+                + no_ext + "'), so merging will split nodes into ghost duplicates. "
+                "Run `graphify extract --force` to rebuild cleanly.",
+                file=sys.stderr,
+            )
+            return
+
+
 def build_from_json(extraction: dict, *, directed: bool = True, root: str | Path | None = None) -> nx.Graph:
     """Build a NetworkX graph from an extraction dict.
 
@@ -155,6 +201,9 @@ def build_from_json(extraction: dict, *, directed: bool = True, root: str | Path
     real_errors = [e for e in errors if "does not match any node id" not in e]
     if real_errors:
         print(f"[graphify] Extraction warning ({len(real_errors)} issues): {real_errors[0]}", file=sys.stderr)
+    # Loudly flag a graph still on the pre-#952 ID scheme so a half-old/half-new
+    # merge can't happen silently.
+    _warn_if_legacy_id_scheme(extraction.get("nodes", []))
     G: nx.Graph = nx.DiGraph() if directed else nx.Graph()
     for node in extraction.get("nodes", []):
         if "source_file" in node:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from graphify.extract import _file_stem, _make_id, extract
+from graphify.extract import _file_stem, _make_id, canonical_file_id, extract
 
 
 def _write(path: Path, text: str) -> Path:
@@ -17,7 +17,9 @@ def _extract_for(paths: list[Path], root: Path):
 
 
 def _has_edge(result: dict, source: str, target: str, relation: str = "imports_from") -> bool:
-    expected = (_make_id(source), _make_id(target), relation)
+    # Source and target are repo-relative file paths; file node IDs are now the
+    # canonical (extension-stripped) form (#952).
+    expected = (canonical_file_id(source), canonical_file_id(target), relation)
     actual = {
         (edge["source"], edge["target"], edge["relation"])
         for edge in result["edges"]
@@ -32,7 +34,7 @@ def _has_symbol_edge(
     symbol: str,
     relation: str = "imports",
 ) -> bool:
-    expected = (_make_id(source), _make_id(_file_stem(Path(target_file)), symbol), relation)
+    expected = (canonical_file_id(source), _make_id(_file_stem(Path(target_file)), symbol), relation)
     actual = {
         (edge["source"], edge["target"], edge["relation"])
         for edge in result["edges"]

@@ -401,12 +401,19 @@ def _file_evidence_ids(source_file: str) -> set[str]:
     ``_bash_make_id``) so a file-level ``imports_from`` edge can be matched
     back to the candidate target's defining file without reconstructing the
     exact import statement.
+
+    The canonical file node id is the full path with the extension removed
+    (``extract.canonical_file_id``), so the primary candidate is the
+    extension-stripped path. The extension-bearing, bare-stem, and
+    parent-qualified forms are kept as defensive fallbacks for legacy graphs and
+    for stub/module-name import targets.
     """
 
     if not source_file:
         return set()
     path = Path(source_file)
-    ids = {_bash_make_id(str(path)), _bash_make_id(path.stem)}
+    no_ext = str(path.with_suffix("")) if path.suffix else str(path)
+    ids = {_bash_make_id(no_ext), _bash_make_id(str(path)), _bash_make_id(path.stem)}
     parent = path.parent.name
     if parent and parent not in (".", ""):
         ids.add(_bash_make_id(f"{parent}.{path.stem}"))
@@ -502,13 +509,17 @@ def _bash_make_id(*parts: str) -> str:
 
 
 def _file_node_id_for_path(path: Path, root: Path) -> str:
-    # Resolve both sides so callers that pass relative or non-canonical roots
-    # get the same canonical relative path that extract()'s id_remap produces.
-    # _bash_make_id is an exact copy of extract._make_id, so IDs match.
+    # Mirror extract.canonical_file_id: the full repo-relative path with the
+    # file extension removed, normalized by _make_id. _bash_make_id is an exact
+    # copy of extract._make_id, so the emitted edge endpoints match the file
+    # node ids extract() produces (#952). Resolve both sides so callers that pass
+    # relative or non-canonical roots still relativize correctly.
     try:
-        return _bash_make_id(str(path.resolve().relative_to(root.resolve())))
+        rel = path.resolve().relative_to(root.resolve())
     except ValueError:
-        return _bash_make_id(str(path))  # path outside root: hash absolute path as fallback
+        rel = path  # path outside root: fall back to the path as given
+    no_ext = rel.with_suffix("") if rel.suffix else rel
+    return _bash_make_id(str(no_ext))
 
 
 def resolve_bash_source_edges(
