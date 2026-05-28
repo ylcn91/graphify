@@ -436,3 +436,32 @@ def prune_repo_from_graph(G: nx.Graph, repo_tag: str) -> int:
     to_remove = [n for n, d in G.nodes(data=True) if d.get("repo") == repo_tag]
     G.remove_nodes_from(to_remove)
     return len(to_remove)
+
+
+def prune_low_degree_nodes(graph_data: dict, min_degree: int) -> tuple[dict, int]:
+    """Drop nodes whose total degree (in+out) on the original graph is < min_degree.
+
+    Operates on the raw graph.json dict (the ``links``/``edges`` form) rather than
+    a NetworkX graph so every node/edge field (``community``, ``norm_label``, the
+    top-level ``directed`` flag, etc.) round-trips untouched — mirrors
+    ``export.prune_dangling_edges``. Degree counts edges to all neighbors and is
+    direction-agnostic: a node with one inbound and one outbound edge has degree 2,
+    so ``min_degree=1`` drops only isolated (degree-0) nodes and ``min_degree=2``
+    also drops degree-1 leaves. Self-loops count toward degree (one per incident
+    edge endpoint). Dangling edges left behind are NOT removed here — call
+    ``prune_dangling_edges`` afterwards. Returns the mutated dict and the count of
+    removed nodes.
+    """
+    links_key = "links" if "links" in graph_data else "edges"
+    degree: dict[str, int] = {n["id"]: 0 for n in graph_data.get("nodes", [])}
+    for e in graph_data.get(links_key, []):
+        src, tgt = e.get("source"), e.get("target")
+        if src in degree:
+            degree[src] += 1
+        if tgt in degree:
+            degree[tgt] += 1
+    before = len(graph_data.get("nodes", []))
+    graph_data["nodes"] = [
+        n for n in graph_data.get("nodes", []) if degree.get(n["id"], 0) >= min_degree
+    ]
+    return graph_data, before - len(graph_data["nodes"])

@@ -1521,6 +1521,9 @@ def main() -> None:
         print("  cluster-only <path>     rerun clustering on an existing graph.json and regenerate report")
         print("    --no-viz                skip graph.html generation (useful for >5000 node graphs / CI)")
         print("    --graph <path>          path to graph.json (default <path>/graphify-out/graph.json)")
+        print("  prune [path]            drop low-degree (noise) nodes from graph.json and rewrite it")
+        print("    --min-degree N          remove nodes with total degree (in+out) < N (default 1: drops isolated nodes)")
+        print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
         print("    --context C             explicit edge-context filter (repeatable)")
@@ -2504,6 +2507,64 @@ def main() -> None:
                     html_target.unlink()
                 print(f"Skipped graph.html: {viz_err}")
                 print(f"Done — {len(communities)} communities. GRAPH_REPORT.md and graph.json updated.")
+
+    elif cmd == "prune":
+        # Graph hygiene: drop low-degree (noise) nodes from an existing
+        # graph.json and rewrite it in place. Mirrors query/cluster-only arg
+        # parsing — optional positional path or --graph, hand-rolled walk so
+        # flags and the path can appear in any order.
+        min_degree = 1  # default: drop only isolated (degree-0) nodes
+        graph_path = _default_graph_path()
+        args = sys.argv[2:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--min-degree" and i + 1 < len(args):
+                try:
+                    min_degree = int(args[i + 1])
+                except ValueError:
+                    print("error: --min-degree must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 2
+            elif args[i].startswith("--min-degree="):
+                try:
+                    min_degree = int(args[i].split("=", 1)[1])
+                except ValueError:
+                    print("error: --min-degree must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                i += 1
+            elif args[i] == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]; i += 2
+            elif args[i].startswith("--"):
+                i += 1
+            else:
+                graph_path = args[i]; i += 1
+        gp = Path(graph_path).resolve()
+        if not gp.exists():
+            print(f"error: graph file not found: {gp}", file=sys.stderr)
+            sys.exit(1)
+        if not gp.suffix == ".json":
+            print("error: graph file must be a .json file", file=sys.stderr)
+            sys.exit(1)
+        _enforce_graph_size_cap_or_exit(gp)
+        from graphify.build import prune_low_degree_nodes
+        from graphify.export import prune_dangling_edges
+        try:
+            data = json.loads(gp.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"error: could not load graph: {exc}", file=sys.stderr)
+            sys.exit(1)
+        links_key = "links" if "links" in data else "edges"
+        nodes_before = len(data.get("nodes", []))
+        edges_before = len(data.get(links_key, []))
+        data, removed_nodes = prune_low_degree_nodes(data, min_degree)
+        data, removed_edges = prune_dangling_edges(data)
+        nodes_after = len(data.get("nodes", []))
+        edges_after = len(data.get(links_key, []))
+        with open(gp, "w", encoding="utf-8") as f:  # nosec
+            json.dump(data, f, indent=2)
+        print(f"Pruned graph at {gp} (--min-degree {min_degree})")
+        print(f"  nodes: {nodes_before} -> {nodes_after} ({removed_nodes} removed)")
+        print(f"  edges: {edges_before} -> {edges_after} ({removed_edges} removed)")
 
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
