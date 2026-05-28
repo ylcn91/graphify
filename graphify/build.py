@@ -104,11 +104,16 @@ def edge_datas(G: nx.Graph, u: str, v: str) -> list[dict]:
     return [raw]
 
 
-def build_from_json(extraction: dict, *, directed: bool = False, root: str | Path | None = None) -> nx.Graph:
+def build_from_json(extraction: dict, *, directed: bool = True, root: str | Path | None = None) -> nx.Graph:
     """Build a NetworkX graph from an extraction dict.
 
-    directed=True produces a DiGraph that preserves edge direction (source→target).
-    directed=False (default) produces an undirected Graph for backward compatibility.
+    directed=True (default) produces a DiGraph that preserves edge direction
+        (source→target). An undirected Graph collapses each directed edge onto an
+        unordered node pair, so when two directed edges share endpoints (e.g.
+        a→b and b→a, or a→b emitted twice) the last write wins and the others are
+        silently dropped or reversed (#1061). DiGraph keeps them distinct.
+    directed=False opts into an undirected Graph (used for already-undirected
+        graph.json reloads and clustering, which coerces to undirected anyway).
     root: if given, absolute source_file paths from semantic subagents are made
         relative to root so all nodes share a consistent path key (#932).
     """
@@ -220,15 +225,17 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
 def build(
     extractions: list[dict],
     *,
-    directed: bool = False,
+    directed: bool = True,
     dedup: bool = True,
     dedup_llm_backend: str | None = None,
     root: str | Path | None = None,
 ) -> nx.Graph:
     """Merge multiple extraction results into one graph.
 
-    directed=True produces a DiGraph that preserves edge direction (source→target).
-    directed=False (default) produces an undirected Graph for backward compatibility.
+    directed=True (default) produces a DiGraph that preserves edge direction
+        (source→target). directed=False opts into an undirected Graph, which
+        collapses directional edges that share endpoints and can drop or reverse
+        them (#1061).
     dedup=True (default) runs entity deduplication before building the graph.
     dedup_llm_backend: if set (e.g. "gemini", "claude", or "kimi"), uses LLM to resolve
         ambiguous pairs in the 75–92 Jaro-Winkler score zone.

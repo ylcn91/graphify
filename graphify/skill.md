@@ -18,7 +18,7 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify <url1> <url2> ...                           # clone multiple repos, build each, merge into one cross-repo graph
 /graphify <path> --mode deep                          # thorough extraction, richer INFERRED edges
 /graphify <path> --update                             # incremental - re-extract only new/changed files
-/graphify <path> --directed                            # build directed graph (preserves edge direction: source→target)
+/graphify <path> --directed                            # (default) directed graph preserving edge direction: source→target
 /graphify <path> --whisper-model medium                # use a larger Whisper model for better transcription accuracy
 /graphify <path> --cluster-only                       # rerun clustering on existing graph
 /graphify <path> --no-viz                             # skip visualization, just report + JSON
@@ -511,7 +511,7 @@ print(f'Merged: {total} nodes, {edges} edges ({len(ast[\"nodes\"])} AST + {len(s
 
 ### Step 4 - Build graph, cluster, analyze, generate outputs
 
-**Before starting:** note whether `--directed` was given. If so, pass `directed=True` to `build_from_json()` in the code block below. This builds a `DiGraph` that preserves edge direction (source→target) instead of the default undirected `Graph`.
+**Edge direction:** `build_from_json()` builds a `DiGraph` by default, preserving edge direction (source→target) so caller→callee relationships survive (#1061). No special handling is needed — the code block below is already directed. Pass `directed=False` only if you explicitly want an undirected `Graph`.
 
 ```bash
 mkdir -p graphify-out
