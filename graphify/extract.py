@@ -8742,6 +8742,159 @@ def extract_dmf(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+# ── GDScript (.gd) — regex extractor, no tree-sitter grammar bundled ─────────
+# GDScript has no tree-sitter grammar shipped with graphify, so (like Pascal's
+# regex fallback) it is parsed with regexes. GDScript is Python-like:
+# `extends Base`, `class_name Foo`, `func name(...)`, `var`/`const`, `signal`,
+# and nested `class Inner:` blocks.
+_GD_CLASS_NAME_RE = re.compile(r"^\s*class_name\s+([A-Za-z_]\w*)", re.MULTILINE)
+_GD_EXTENDS_RE = re.compile(r'^\s*extends\s+(?:"[^"]+"|([A-Za-z_][\w.]*))', re.MULTILINE)
+_GD_FUNC_RE = re.compile(r"^([ \t]*)func\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+_GD_INNER_CLASS_RE = re.compile(r"^([ \t]*)class\s+([A-Za-z_]\w*)\s*:", re.MULTILINE)
+_GD_MEMBER_RE = re.compile(
+    r"^([ \t]*)(?:@export\s+)?(?:onready\s+)?(?:var|const|signal)\s+([A-Za-z_]\w*)",
+    re.MULTILINE,
+)
+_GD_CALL_RE = re.compile(r"(?:self\.)?([A-Za-z_]\w*)\s*\(")
+_GD_KEYWORDS = frozenset({
+    "if", "elif", "else", "for", "while", "match", "func", "return",
+    "var", "const", "signal", "class", "class_name", "extends", "enum",
+    "and", "or", "not", "in", "is", "as", "self", "true", "false", "null",
+    "pass", "break", "continue", "await", "yield", "print", "preload",
+    "load", "range", "len", "str", "int", "float", "bool", "Vector2",
+    "Vector3", "assert", "super",
+})
+
+
+def extract_gdscript(path: Path) -> dict:
+    """Regex extractor for Godot GDScript (.gd) files.
+
+    GDScript has no tree-sitter grammar bundled with graphify, so it is parsed
+    with regexes — the same precedent as the Pascal regex fallback. Produces:
+    - file node
+    - a script-class node (from `class_name`, else the file stem)
+    - script --inherits--> base (from `extends`)
+    - func nodes attached to their script/inner class
+    - inner `class Foo:` nodes
+    - var/const/signal member nodes
+    - intra-file call edges between defined funcs
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return {"nodes": [], "edges": [], "error": str(exc)}
+
+    str_path = str(path)
+    stem = _file_stem(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    seen_call_pairs: set[tuple[str, str]] = set()
+
+    def _add_node(nid: str, label: str, line: int) -> None:
+        if nid and nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line}"})
+
+    def _add_edge(src: str, tgt: str, relation: str, line: int,
+                  context: str | None = None) -> None:
+        if not src or not tgt or src == tgt:
+            return
+        edge: dict = {"source": src, "target": tgt, "relation": relation,
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "source_location": f"L{line}", "weight": 1.0}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    def _lineno(offset: int) -> int:
+        return raw.count("\n", 0, offset) + 1
+
+    file_nid = _make_id(str_path)
+    _add_node(file_nid, path.name, 1)
+
+    # Script class node: explicit `class_name`, else the file stem.
+    cn_m = _GD_CLASS_NAME_RE.search(raw)
+    script_name = cn_m.group(1) if cn_m else path.stem
+    script_nid = _make_id(stem, script_name)
+    _add_node(script_nid, script_name, _lineno(cn_m.start()) if cn_m else 1)
+    _add_edge(file_nid, script_nid, "contains", _lineno(cn_m.start()) if cn_m else 1)
+
+    # Inheritance via `extends`.
+    ext_m = _GD_EXTENDS_RE.search(raw)
+    if ext_m and ext_m.group(1):
+        base = ext_m.group(1).split(".")[-1]
+        base_nid = _make_id(base)
+        _add_node(base_nid, base, _lineno(ext_m.start()))
+        _add_edge(script_nid, base_nid, "inherits", _lineno(ext_m.start()))
+
+    # Inner classes (record their indent + name so funcs can attach to them).
+    inner_classes: list[tuple[int, str, str]] = []  # (indent, name, nid)
+    for cm in _GD_INNER_CLASS_RE.finditer(raw):
+        indent = len(cm.group(1).expandtabs())
+        name = cm.group(2)
+        nid = _make_id(stem, script_name, name)
+        line = _lineno(cm.start())
+        _add_node(nid, name, line)
+        _add_edge(script_nid, nid, "contains", line)
+        inner_classes.append((indent, name, nid))
+
+    def _container_for(indent: int) -> str:
+        """Closest enclosing inner class declared at a smaller indent, else the script."""
+        best_nid = script_nid
+        best_indent = -1
+        for c_indent, _name, c_nid in inner_classes:
+            if c_indent < indent and c_indent > best_indent:
+                best_indent = c_indent
+                best_nid = c_nid
+        return best_nid
+
+    # Functions / methods.
+    func_nids: dict[str, str] = {}
+    func_records: list[tuple[str, int, int, int]] = []  # (nid, body_start, line, body_end)
+    func_matches = list(_GD_FUNC_RE.finditer(raw))
+    for i, fm in enumerate(func_matches):
+        indent = len(fm.group(1).expandtabs())
+        name = fm.group(2)
+        line = _lineno(fm.start())
+        container = _container_for(indent)
+        nid = _make_id(container, name)
+        _add_node(nid, f"{name}()", line)
+        _add_edge(container, nid, "method", line)
+        func_nids.setdefault(name, nid)
+        body_end = func_matches[i + 1].start() if i + 1 < len(func_matches) else len(raw)
+        func_records.append((nid, fm.end(), line, body_end))
+
+    # var / const / signal members.
+    for mm in _GD_MEMBER_RE.finditer(raw):
+        name = mm.group(2)
+        line = _lineno(mm.start())
+        container = _container_for(len(mm.group(1).expandtabs()))
+        nid = _make_id(container, name)
+        _add_node(nid, name, line)
+        _add_edge(container, nid, "defines", line)
+
+    # Intra-file call edges.
+    for caller_nid, body_start, caller_line, body_end in func_records:
+        body = raw[body_start:body_end]
+        for call in _GD_CALL_RE.finditer(body):
+            callee = call.group(1)
+            if callee in _GD_KEYWORDS:
+                continue
+            callee_nid = func_nids.get(callee)
+            if not callee_nid or callee_nid == caller_nid:
+                continue
+            pair = (caller_nid, callee_nid)
+            if pair in seen_call_pairs:
+                continue
+            seen_call_pairs.add(pair)
+            call_line = caller_line + body.count("\n", 0, call.start())
+            _add_edge(caller_nid, callee_nid, "calls", call_line, context="call")
+
+    return {"nodes": nodes, "edges": edges}
+
+
 _DISPATCH: dict[str, Any] = {
     ".py": extract_python,
     ".js": extract_js,
@@ -8791,6 +8944,7 @@ _DISPATCH: dict[str, Any] = {
     ".svelte": extract_svelte,
     ".astro": extract_astro,
     ".dart": extract_dart,
+    ".gd": extract_gdscript,
     ".v": extract_verilog,
     ".sv": extract_verilog,
     ".svh": extract_verilog,
