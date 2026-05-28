@@ -6621,6 +6621,44 @@ def extract_elixir(path: Path) -> dict:
     return {"nodes": nodes, "edges": clean_edges, "raw_calls": raw_calls, "input_tokens": 0, "output_tokens": 0}
 
 
+# Inline link [text](target) — target is up to the first whitespace or ")" so a
+# trailing `"title"` is excluded. Reference link [text][ref] and definition
+# [ref]: target. Images ![alt](src) are excluded by the negative lookbehind.
+_MD_INLINE_LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(\s*([^)\s]+)")
+_MD_REF_LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\[([^\]]+)\]")
+_MD_REF_DEF_RE = re.compile(r"^\s*\[([^\]]+)\]:\s*(\S+)")
+
+# Schemes that name an external/non-file resource — never a corpus edge.
+_MD_EXTERNAL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
+
+def _resolve_markdown_link_target(target: str, base_dir: Path) -> str | None:
+    """Resolve a Markdown link target to a corpus file node ID, or None.
+
+    Returns the file node ID — ``_file_node_id(resolved_path)``, the same form
+    the import resolvers emit — for a LOCAL relative path that points at an
+    existing file, so extract()'s canonical remap aligns it with the target
+    file's own node id. Returns None for external URLs (http/https/mailto/any
+    ``scheme:`` target), in-document anchors (``#section``), absolute paths, and
+    targets that don't resolve to a file on disk.
+    """
+    target = target.strip().strip("<>")
+    if not target:
+        return None
+    # Drop a trailing #anchor / ?query so docs/guide.md#install resolves to the file.
+    target = target.split("#", 1)[0].split("?", 1)[0]
+    if not target:
+        return None  # pure in-document anchor like [x](#section)
+    if target.startswith("/") or target.startswith("\\"):
+        return None  # site-absolute path — not a corpus-relative file
+    if _MD_EXTERNAL_SCHEME_RE.match(target):
+        return None  # http:, https:, mailto:, etc.
+    resolved = Path(os.path.normpath(base_dir / target))
+    if not resolved.is_file():
+        return None
+    return _file_node_id(resolved)
+
+
 def extract_markdown(path: Path) -> dict:
     """Extract structural nodes and edges from a Markdown file.
 
@@ -6634,6 +6672,9 @@ def extract_markdown(path: Path) -> dict:
     - parent heading --contains--> child heading (nesting by level)
     - heading --contains--> code block
     - heading --references--> other node (when backtick `Name` matches a known pattern)
+    - file --references--> target file (Markdown link [text](./other.md) to another
+      corpus file; #951). Inline and reference-style links resolve relative to this
+      file; links inside fenced code blocks and external URLs are ignored.
 
     No tree-sitter dependency — pure line-by-line parsing.
     """
@@ -6671,6 +6712,14 @@ def extract_markdown(path: Path) -> dict:
     code_block_lines: list[str] = []
     code_block_count = 0
 
+    # Markdown link edges (#951): inline [text](target) and reference-style
+    # [text][ref] + [ref]: target. Collected during the line scan (skipping
+    # fenced code blocks) and resolved after, so reference definitions that
+    # appear below their use still resolve. Each entry is (target, line).
+    inline_link_targets: list[tuple[str, int]] = []
+    ref_link_uses: list[tuple[str, int]] = []      # (ref label, line)
+    ref_link_defs: dict[str, str] = {}             # ref label (casefold) -> target
+
     lines = source.splitlines()
     for line_num_0, line_text in enumerate(lines):
         line_num = line_num_0 + 1
@@ -6706,6 +6755,18 @@ def extract_markdown(path: Path) -> dict:
             code_block_lines.append(line_text)
             continue
 
+        # Collect Markdown links on this content line (#951). Inline links
+        # [text](target) become file edges; reference-style [text][ref] and
+        # their [ref]: target definitions are gathered for post-loop resolution.
+        ref_def = _MD_REF_DEF_RE.match(line_text)
+        if ref_def:
+            ref_link_defs[ref_def.group(1).strip().casefold()] = ref_def.group(2).strip()
+        else:
+            for m in _MD_INLINE_LINK_RE.finditer(line_text):
+                inline_link_targets.append((m.group(1).strip(), line_num))
+            for m in _MD_REF_LINK_RE.finditer(line_text):
+                ref_link_uses.append((m.group(1).strip().casefold(), line_num))
+
         # Detect headings: # Heading, ## Heading, etc.
         heading_match = re.match(r'^(#{1,6})\s+(.+)', line_text)
         if heading_match:
@@ -6727,6 +6788,25 @@ def extract_markdown(path: Path) -> dict:
 
             heading_stack.append((level, h_nid))
             continue
+
+    # Resolve collected links to file edges (#951). A link to another file in
+    # the corpus emits `file --references--> <target file node id>`. The target
+    # id is computed with _file_node_id(resolved_path) exactly as the JS/Python
+    # import resolvers do, so extract()'s post-extraction canonical remap rewrites
+    # this endpoint identically to the target file's own node id. Links to files
+    # outside the corpus stay dangling and are dropped by build_from_json (same
+    # as unresolved imports); external/absolute URLs never produce an edge.
+    base_dir = path.parent
+    resolved_uses: list[tuple[str, int]] = list(inline_link_targets)
+    for ref_label, ref_line in ref_link_uses:
+        target = ref_link_defs.get(ref_label)
+        if target:
+            resolved_uses.append((target, ref_line))
+
+    for target, link_line in resolved_uses:
+        tgt_nid = _resolve_markdown_link_target(target, base_dir)
+        if tgt_nid and tgt_nid != file_nid:
+            add_edge(file_nid, tgt_nid, "references", link_line)
 
     return {"nodes": nodes, "edges": edges, "input_tokens": 0, "output_tokens": 0}
 
