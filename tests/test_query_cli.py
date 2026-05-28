@@ -51,6 +51,39 @@ def test_query_cli_heuristic_context_filter(monkeypatch, tmp_path, capsys):
     assert "build" not in out
 
 
+def test_query_cli_renders_true_edge_direction(monkeypatch, tmp_path, capsys):
+    """query must render the real caller→callee direction, not BFS discovery order.
+
+    The edge is alphafunc --calls--> betafunc. Querying the callee discovers the
+    caller via an undirected traversal hop (callee→caller), so a naive renderer
+    would print the arrow backwards. The output must still read alphafunc → betafunc.
+    """
+    data = {
+        "directed": True,
+        "nodes": [
+            {"id": "caller", "label": "alphafunc", "source_file": "a.py", "community": 0},
+            {"id": "callee", "label": "betafunc", "source_file": "b.py", "community": 0},
+        ],
+        "links": [
+            {"source": "caller", "target": "callee", "relation": "calls",
+             "confidence": "EXTRACTED", "context": "call"},
+        ],
+    }
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(data))
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        ["graphify", "query", "betafunc", "--graph", str(graph_path)],
+    )
+    mainmod.main()
+    out = capsys.readouterr().out
+    assert "alphafunc --calls" in out
+    assert "--> betafunc" in out
+    assert "betafunc --calls" not in out
+
+
 def test_query_cli_rejects_oversized_graph(monkeypatch, tmp_path, capsys):
     """#F4: query CLI must refuse to parse a graph.json that exceeds the cap."""
     import pytest

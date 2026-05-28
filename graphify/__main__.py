@@ -1474,6 +1474,11 @@ def main() -> None:
         print("    --context C             explicit edge-context filter (repeatable)")
         print("    --budget N              cap output at N tokens (default 2000)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        print("  lens <path> \"<question>\"  build code graph if stale (no LLM), then answer compactly")
+        print("    --rebuild               force an AST-only rebuild before querying")
+        print("    --budget N              cap output at N tokens (default 600)")
+        print("    --depth N               traversal depth (default 2)")
+        print("    --dfs / --context C     depth-first / explicit edge-context filter (repeatable)")
         print("  affected \"X\"             reverse traversal to find nodes impacted by X")
         print("    --relation R            edge relation to traverse in reverse (repeatable)")
         print("    --depth N               reverse traversal depth (default 2)")
@@ -1840,6 +1845,10 @@ def main() -> None:
             _raw = _json.loads(gp.read_text(encoding="utf-8"))
             if "links" not in _raw and "edges" in _raw:
                 _raw = dict(_raw, links=_raw["edges"])
+            # Force directed so true caller→callee direction survives the load
+            # (matches `path`/`explain`). query traverses an undirected view for
+            # recall but renders the real edge orientation, not BFS discovery order.
+            _raw = {**_raw, "directed": True}
             try:
                 G = json_graph.node_link_graph(_raw, edges="links")
             except TypeError:
@@ -1855,6 +1864,106 @@ def main() -> None:
                 depth=2,
                 token_budget=budget,
                 context_filters=context_filters,
+            )
+        )
+    elif cmd == "lens":
+        # One-shot "build (code-only, no LLM) + ask" wrapper. Ensures a
+        # deterministic AST graph exists for <path>, then answers <question>
+        # with a direction-correct, token-bounded subgraph. Built for low
+        # context usage by humans and AI agents on a single repo.
+        from graphify.serve import _query_graph_text
+        from networkx.readwrite import json_graph
+        args = sys.argv[2:]
+        if len(args) < 2:
+            print(
+                'Usage: graphify lens <path> "<question>" '
+                "[--rebuild] [--budget N] [--depth N] [--dfs] [--context C]",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        target, question = args[0], args[1]
+        rebuild = False
+        budget = 600
+        depth = 2
+        use_dfs = False
+        context_filters = []
+        rest = args[2:]
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--rebuild":
+                rebuild = True; i += 1
+            elif a == "--dfs":
+                use_dfs = True; i += 1
+            elif a in ("--budget", "--depth") and i + 1 < len(rest):
+                try:
+                    val = int(rest[i + 1])
+                except ValueError:
+                    print(f"error: {a} must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                budget, depth = (val, depth) if a == "--budget" else (budget, val)
+                i += 2
+            elif a.startswith(("--budget=", "--depth=")):
+                key, _, raw = a.partition("=")
+                try:
+                    val = int(raw)
+                except ValueError:
+                    print(f"error: {key} must be an integer", file=sys.stderr)
+                    sys.exit(1)
+                budget, depth = (val, depth) if key == "--budget" else (budget, val)
+                i += 1
+            elif a == "--context" and i + 1 < len(rest):
+                context_filters.append(rest[i + 1]); i += 2
+            elif a.startswith("--context="):
+                context_filters.append(a.split("=", 1)[1]); i += 1
+            else:
+                print(f"error: unknown lens option: {a}", file=sys.stderr)
+                sys.exit(2)
+        tpath = Path(target)
+        if tpath.suffix == ".json":
+            graph_file = tpath
+        else:
+            graph_file = tpath / _GRAPHIFY_OUT / "graph.json"
+            if rebuild or not graph_file.exists():
+                if not tpath.exists():
+                    print(f"error: path not found: {tpath}", file=sys.stderr)
+                    sys.exit(1)
+                from graphify.watch import _rebuild_code
+                print(
+                    f"[lens] building AST-only code graph for {tpath} (no LLM)...",
+                    file=sys.stderr,
+                )
+                _rebuild_code(tpath, force=rebuild, no_cluster=False, block_on_lock=True)
+        gp = graph_file.resolve()
+        if not gp.exists():
+            print(f"error: graph not found at {gp} (no code files, or build failed)", file=sys.stderr)
+            sys.exit(1)
+        if gp.suffix != ".json":
+            print("error: graph file must be a .json file", file=sys.stderr)
+            sys.exit(1)
+        _enforce_graph_size_cap_or_exit(gp)
+        try:
+            import json as _json
+            _raw = _json.loads(gp.read_text(encoding="utf-8"))
+            if "links" not in _raw and "edges" in _raw:
+                _raw = dict(_raw, links=_raw["edges"])
+            # Load directed so the answer renders true caller→callee direction.
+            _raw = {**_raw, "directed": True}
+            try:
+                G = json_graph.node_link_graph(_raw, edges="links")
+            except TypeError:
+                G = json_graph.node_link_graph(_raw)
+        except Exception as exc:
+            print(f"error: could not load graph: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(
+            _query_graph_text(
+                G,
+                question,
+                mode="dfs" if use_dfs else "bfs",
+                depth=depth,
+                token_budget=budget,
+                context_filters=context_filters or None,
             )
         )
     elif cmd == "affected":

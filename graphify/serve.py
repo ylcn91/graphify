@@ -363,15 +363,24 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
         lines.append(line)
     for u, v in edges:
         if u in nodes and v in nodes:
-            raw = G[u][v]
+            # `edges` come from an undirected traversal, so (u, v) is discovery
+            # order. Recover the true source→target from the graph; for an
+            # undirected graph has_edge is symmetric and (u, v) is kept as-is.
+            if G.has_edge(u, v):
+                su, tv = u, v
+            elif G.has_edge(v, u):
+                su, tv = v, u
+            else:
+                continue
+            raw = G[su][tv]
             d = next(iter(raw.values()), {}) if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)) else raw
             context = d.get("context")
             context_suffix = f" context={sanitize_label(str(context))}" if context else ""
             line = (
-                f"EDGE {sanitize_label(G.nodes[u].get('label', u))} "
+                f"EDGE {sanitize_label(G.nodes[su].get('label', su))} "
                 f"--{sanitize_label(str(d.get('relation', '')))} "
                 f"[{sanitize_label(str(d.get('confidence', '')))}{context_suffix}]--> "
-                f"{sanitize_label(G.nodes[v].get('label', v))}"
+                f"{sanitize_label(G.nodes[tv].get('label', tv))}"
             )
             lines.append(line)
     output = "\n".join(lines)
@@ -405,7 +414,11 @@ def _query_graph_text(
         return "No matching nodes found."
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)
     traversal_graph = _filter_graph_by_context(G, resolved_filters)
-    nodes, edges = _dfs(traversal_graph, start_nodes, depth) if mode == "dfs" else _bfs(traversal_graph, start_nodes, depth)
+    # Traverse on an undirected view so recall isn't limited to out-edges — on a
+    # directed graph plain neighbors() would hide callers/parents. Direction is
+    # recovered at render time from the directed graph, so arrows stay correct.
+    search_graph = traversal_graph.to_undirected(as_view=True) if traversal_graph.is_directed() else traversal_graph
+    nodes, edges = _dfs(search_graph, start_nodes, depth) if mode == "dfs" else _bfs(search_graph, start_nodes, depth)
     header_parts = [
         f"Traversal: {mode.upper()} depth={depth}",
         f"Start: {[G.nodes[n].get('label', n) for n in start_nodes]}",
