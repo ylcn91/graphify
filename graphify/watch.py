@@ -560,7 +560,17 @@ def _rebuild_code(
 
         _relativize_source_files(result, project_root)
         out.mkdir(exist_ok=True)
-        (out / ".graphify_root").write_text(str(watch_root), encoding="utf-8")
+        try:
+            from graphify.cache import ensure_out_gitignore
+            ensure_out_gitignore(project_root)
+        except Exception:
+            pass
+        # Persist the user-provided anchor (often ".") rather than the resolved
+        # absolute path so a git-shared graphify-out/ stays portable: a clone on
+        # another machine reads this back as a relative path that still resolves
+        # against its own CWD instead of a stale, machine-specific absolute path
+        # that no longer exists (#777).
+        (out / ".graphify_root").write_text(str(watch_path), encoding="utf-8")
 
         if no_cluster:
             # Normalise to "links" key so schema is consistent with the full clustered path.
@@ -590,7 +600,7 @@ def _rebuild_code(
 
             try:
                 from graphify.detect import save_manifest
-                save_manifest(detected["files"], kind="ast")
+                save_manifest(detected["files"], kind="ast", root=project_root)
             except Exception:
                 pass
 
@@ -628,7 +638,7 @@ def _rebuild_code(
             if same_topology:
                 try:
                     from graphify.detect import save_manifest
-                    save_manifest(detected["files"], kind="ast")
+                    save_manifest(detected["files"], kind="ast", root=project_root)
                 except Exception:
                     pass
                 flag = out / "needs_update"
@@ -699,7 +709,7 @@ def _rebuild_code(
 
         try:
             from graphify.detect import save_manifest
-            save_manifest(detected["files"], kind="ast")
+            save_manifest(detected["files"], kind="ast", root=project_root)
         except Exception:
             pass
 

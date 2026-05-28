@@ -1,0 +1,21 @@
+# Transient and machine-local graphify artifacts.
+# The portable graph (graph.json, GRAPH_REPORT.md, manifest.json, labels,
+# and the now-relative cache/ast + cache/semantic entries) stays tracked so a
+# committed graphify-out/ is shareable across machines and clones.
+
+# Watch/rebuild coordination — PIDs and queues are local to one machine.
+.rebuild.lock
+.rebuild.pending
+.rebuild.pending.draining
+
+# Transient flags and atomic-write temp files.
+needs_update
+.graph.tmp.json
+*.tmp
+
+# Stat fastpath index — keyed by absolute paths + mtime_ns, never portable.
+cache/stat-index.json
+cache/**/*.tmp
+
+# Dated pre-overwrite snapshots — local backup history, not shared state.
+20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/

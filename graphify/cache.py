@@ -35,10 +35,94 @@ _stat_index_root: Path | None = None
 _stat_index_dirty: bool = False
 
 
-def _stat_index_file(root: Path) -> Path:
+# VCS markers used to bound the upward search for a canonical output dir.
+_VCS_MARKERS = (".git", ".hg", ".svn", "_darcs", ".fossil")
+
+
+def _out_base(root: Path) -> Path:
+    """Resolve the single canonical graphify-out/ directory for ``root``.
+
+    A subpath scan infers a deeper ``root`` (e.g. the common prefix ``src/`` of
+    the scanned files) than the project root that already owns ``graphify-out/``.
+    Anchoring the cache blindly at that inferred root spawns a SECOND cache dir
+    under the subdirectory while graph.json/manifest live at the project root
+    (#1012/#467). To keep one canonical location, walk upward from ``root`` and
+    reuse the nearest existing ``<ancestor>/graphify-out`` if one is found;
+    otherwise fall back to ``root/graphify-out``.
+
+    An absolute GRAPHIFY_OUT is already a single shared location — return it
+    unchanged. The walk stops at the VCS root / home / filesystem root so an
+    unrelated parent project's output dir is never adopted.
+    """
     _out = Path(_GRAPHIFY_OUT)
-    base = _out if _out.is_absolute() else Path(root).resolve() / _out
-    return base / "cache" / "stat-index.json"
+    if _out.is_absolute():
+        return _out
+    start = Path(root).resolve()
+    home = Path.home()
+    current = start
+    while True:
+        candidate = current / _out
+        if current is not start and candidate.is_dir():
+            return candidate
+        if any((current / m).exists() for m in _VCS_MARKERS):
+            break
+        parent = current.parent
+        if parent == current or current == home:
+            break
+        current = parent
+    return start / _out
+
+
+# Written into a freshly created graphify-out/ so a committed/shared graph
+# excludes transient + machine-local artifacts while keeping the portable graph,
+# report, manifest, and (now relative) cache entries tracked (#777).
+_OUT_GITIGNORE = """\
+# Transient and machine-local graphify artifacts.
+# The portable graph (graph.json, GRAPH_REPORT.md, manifest.json, labels,
+# and the now-relative cache/ast + cache/semantic entries) stays tracked so a
+# committed graphify-out/ is shareable across machines and clones.
+
+# Watch/rebuild coordination — PIDs and queues are local to one machine.
+.rebuild.lock
+.rebuild.pending
+.rebuild.pending.draining
+
+# Transient flags and atomic-write temp files.
+needs_update
+.graph.tmp.json
+*.tmp
+
+# Stat fastpath index — keyed by absolute paths + mtime_ns, never portable.
+cache/stat-index.json
+cache/**/*.tmp
+
+# Dated pre-overwrite snapshots — local backup history, not shared state.
+20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+"""
+
+
+def ensure_out_gitignore(root: Path) -> None:
+    """Drop a .gitignore into the canonical graphify-out/ if absent.
+
+    Idempotent and best-effort: never raises so a read-only or already-tracked
+    output dir can't break extraction. An absolute GRAPHIFY_OUT (shared, often
+    out-of-tree) is left untouched — the user manages its VCS state.
+    """
+    if os.path.isabs(_GRAPHIFY_OUT):
+        return
+    base = _out_base(root)
+    gi = base / ".gitignore"
+    if gi.exists():
+        return
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        gi.write_text(_OUT_GITIGNORE, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _stat_index_file(root: Path) -> Path:
+    return _out_base(root) / "cache" / "stat-index.json"
 
 
 def _ensure_stat_index(root: Path) -> None:
@@ -152,10 +236,9 @@ def cache_dir(root: Path = Path("."), kind: str = "ast") -> Path:
     kind is "ast" or "semantic". Separate subdirectories prevent semantic cache
     entries from overwriting AST cache entries for the same source_file (#582).
     """
-    _out = Path(_GRAPHIFY_OUT)
-    base = _out if _out.is_absolute() else Path(root).resolve() / _out
-    d = base / "cache" / kind
+    d = _out_base(root) / "cache" / kind
     d.mkdir(parents=True, exist_ok=True)
+    ensure_out_gitignore(root)
     return d
 
 
@@ -176,18 +259,90 @@ def load_cached(path: Path, root: Path = Path("."), kind: str = "ast") -> dict |
     entry = cache_dir(root, kind) / f"{h}.json"
     if entry.exists():
         try:
-            return json.loads(entry.read_text(encoding="utf-8"))
+            return _absolutize_source_files(json.loads(entry.read_text(encoding="utf-8")), root)
         except (json.JSONDecodeError, OSError):
             return None
     # Migration fallback: check legacy flat cache/ dir for AST entries
     if kind == "ast":
-        legacy = Path(root).resolve() / _GRAPHIFY_OUT / "cache" / f"{h}.json"
+        legacy = _out_base(root) / "cache" / f"{h}.json"
         if legacy.exists():
             try:
-                return json.loads(legacy.read_text(encoding="utf-8"))
+                return _absolutize_source_files(json.loads(legacy.read_text(encoding="utf-8")), root)
             except (json.JSONDecodeError, OSError):
                 return None
     return None
+
+
+def _absolutize_source_files(result: dict, root: Path) -> dict:
+    """Inverse of :func:`_relativize_source_files`: re-anchor relative
+    ``source_file`` fields back to absolute against ``root`` on read.
+
+    Cache entries are stored relative for portability (#777), but the in-process
+    extraction pipeline (cross-file import/call resolution) matches per-file
+    nodes against ``str(path)`` (absolute). Re-anchoring here makes a cache hit
+    indistinguishable from a fresh extraction, while existing absolute caches
+    (already absolute) pass through unchanged so they still load. The on-disk
+    file is untouched; only the returned dict is rewritten.
+    """
+    if not isinstance(result, dict):
+        return result
+    # Re-anchor against root AS PASSED (not resolved): fresh extraction records
+    # source_file as str(path) using the caller's unresolved paths, so joining
+    # the relative tail onto the same unresolved root reproduces that exact
+    # string. Resolving here would diverge on /var → /private/var style symlinks
+    # and silently break the per-file source_file == str(path) match in
+    # cross-file resolution.
+    root = Path(root)
+
+    def _abs(item: dict) -> dict:
+        source = item.get("source_file")
+        if not source:
+            return item
+        source_path = Path(source)
+        if source_path.is_absolute():
+            return item
+        return {**item, "source_file": str(root / source_path)}
+
+    out = dict(result)
+    for bucket in ("nodes", "edges", "hyperedges"):
+        items = result.get(bucket)
+        if isinstance(items, list):
+            out[bucket] = [_abs(it) if isinstance(it, dict) else it for it in items]
+    return out
+
+
+def _relativize_source_files(result: dict, root: Path) -> dict:
+    """Return a copy of ``result`` with absolute ``source_file`` fields made
+    relative to ``root``.
+
+    Mirrors watch._relativize_source_files so cache entries written under a
+    git-shared graphify-out/ stay portable (#777): a different absolute prefix
+    on another clone no longer churns every cache/ast/*.json file. Paths already
+    relative, or outside ``root``, are left untouched. The original dict is not
+    mutated. Loaders (build._norm_source_file) re-anchor against the active root
+    on read, so existing absolute caches still load.
+    """
+    root = Path(root).resolve()
+
+    def _rel(item: dict) -> dict:
+        source = item.get("source_file")
+        if not source:
+            return item
+        source_path = Path(source)
+        if not source_path.is_absolute():
+            return item
+        try:
+            rel = source_path.resolve().relative_to(root).as_posix()
+        except ValueError:
+            return item
+        return {**item, "source_file": rel}
+
+    out = dict(result)
+    for bucket in ("nodes", "edges", "hyperedges"):
+        items = result.get(bucket)
+        if isinstance(items, list):
+            out[bucket] = [_rel(it) if isinstance(it, dict) else it for it in items]
+    return out
 
 
 def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "ast") -> None:
@@ -199,6 +354,9 @@ def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "a
     No-ops if `path` is not a regular file. Subagent-produced semantic fragments
     occasionally carry a directory path in `source_file`; skipping them prevents
     IsADirectoryError from aborting the whole batch.
+
+    Absolute ``source_file`` fields are relativized against ``root`` before
+    writing so a committed/shared cache stays portable across machines (#777).
     """
     p = Path(path)
     if not p.is_file():
@@ -206,6 +364,7 @@ def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "a
     h = file_hash(p, root)
     target_dir = cache_dir(root, kind)
     entry = target_dir / f"{h}.json"
+    result = _relativize_source_files(result, root)
     fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=f"{h}.", suffix=".tmp")
     try:
         os.write(fd, json.dumps(result).encode())
@@ -232,7 +391,7 @@ def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "a
 
 def cached_files(root: Path = Path(".")) -> set[str]:
     """Return set of file hashes that have a valid cache entry (any kind)."""
-    base = Path(root).resolve() / _GRAPHIFY_OUT / "cache"
+    base = _out_base(root) / "cache"
     hashes: set[str] = set()
     # Legacy flat entries
     if base.is_dir():
@@ -247,7 +406,7 @@ def cached_files(root: Path = Path(".")) -> set[str]:
 
 def clear_cache(root: Path = Path(".")) -> None:
     """Delete all cache entries (ast/, semantic/, and legacy flat entries)."""
-    base = Path(root).resolve() / _GRAPHIFY_OUT / "cache"
+    base = _out_base(root) / "cache"
     # Legacy flat entries
     if base.is_dir():
         for f in base.glob("*.json"):

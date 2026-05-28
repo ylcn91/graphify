@@ -1037,11 +1037,52 @@ def load_manifest(manifest_path: str = _MANIFEST_PATH) -> dict:
         return {}
 
 
+def _infer_manifest_root(manifest_path: str) -> Path | None:
+    """Infer the scan root from a manifest path under an output dir.
+
+    The manifest is written to ``<root>/<GRAPHIFY_OUT>/manifest.json``, so when
+    the file's parent directory is the configured output dir its grandparent is
+    the scan root. Returns None for bare paths (no output-dir parent), which
+    keeps manifest keys absolute — matching legacy/test expectations.
+    """
+    out_name = os.environ.get("GRAPHIFY_OUT", "graphify-out")
+    # An absolute GRAPHIFY_OUT means a shared/out-of-tree output dir with no
+    # single owning root to relativize against — leave keys absolute.
+    if os.path.isabs(out_name):
+        return None
+    parent = Path(manifest_path).resolve().parent
+    if parent.name == Path(out_name).name:
+        return parent.parent
+    return None
+
+
+def _manifest_key(f: str, root: Path | None) -> str:
+    """Return the manifest key for a file path.
+
+    When ``root`` is given, absolute paths are relativized against it so the
+    manifest is portable across machines/clones (a different absolute prefix on
+    another checkout no longer invalidates every entry — #777). Paths already
+    relative, or outside ``root``, are returned with separators normalised to
+    forward slashes so the same key is produced on Windows and POSIX.
+    """
+    key = f.replace("\\", "/")
+    if root is None:
+        return key
+    p = Path(f)
+    if not p.is_absolute():
+        return key
+    try:
+        return p.resolve().relative_to(root).as_posix()
+    except ValueError:
+        return key
+
+
 def save_manifest(
     files: dict[str, list[str]],
     manifest_path: str = _MANIFEST_PATH,
     *,
     kind: str = "both",
+    root: Path | None = None,
 ) -> None:
     """Save current file mtimes + content hashes for change detection.
 
@@ -1051,7 +1092,18 @@ def save_manifest(
     kind="semantic" — written by `graphify extract` after semantic extraction.
                       Stamps semantic_hash; preserves existing ast_hash.
     kind="both"     — full pipeline: stamps both hashes (default).
+
+    When ``root`` is given, manifest keys are stored relative to it so a
+    git-shared graphify-out/ stays portable (#777). Legacy absolute keys in an
+    existing manifest are re-anchored to relative on rewrite; detect_incremental
+    re-anchors on read so old absolute manifests still resolve.
+
+    When ``root`` is omitted it is inferred from ``manifest_path`` whenever the
+    manifest lives in an output dir (``<root>/graphify-out/manifest.json``), so
+    callers that don't thread a root through still get portable keys. A manifest
+    written to a bare path (e.g. ``<tmp>/manifest.json``) keeps absolute keys.
     """
+    root = root.resolve() if root is not None else _infer_manifest_root(manifest_path)
     existing = load_manifest(manifest_path)
 
     def _normalise_entry(entry):
@@ -1063,20 +1115,41 @@ def save_manifest(
             return entry
         return None
 
+    def _exists(key: str) -> bool:
+        candidates = [Path(key)]
+        if root is not None and not Path(key).is_absolute():
+            candidates.append(root / key)
+        for c in candidates:
+            try:
+                if c.exists():
+                    return True
+            except OSError:
+                continue
+        return False
+
+    # Look up the previous entry for a file regardless of whether the existing
+    # manifest stored it under an absolute or a relative key, so hash fields
+    # carry over when migrating absolute → relative.
+    def _prev_entry(f: str) -> dict:
+        for cand in (f, _manifest_key(f, root)):
+            entry = existing.get(cand)
+            if entry is not None:
+                return _normalise_entry(entry) or {}
+        return {}
+
     # Seed from the existing manifest so incremental callers passing a subset
     # of files don't silently erase entries for untouched files (#917).
     # Prune entries whose file no longer exists on disk — those are genuine
-    # deletions that detect_incremental() should treat as gone.
+    # deletions that detect_incremental() should treat as gone. Re-key legacy
+    # absolute entries to relative so the rewritten manifest is portable.
     manifest: dict[str, dict] = {}
     for f, entry in existing.items():
         normalised = _normalise_entry(entry)
         if normalised is None:
             continue
-        try:
-            if Path(f).exists():
-                manifest[f] = normalised
-        except OSError:
+        if not _exists(f):
             continue
+        manifest[_manifest_key(f, root)] = normalised
 
     for file_list in files.values():
         for f in file_list:
@@ -1086,7 +1159,7 @@ def save_manifest(
                 h = _md5_file(p)
             except OSError:
                 continue  # file deleted between detect() and manifest write
-            prev = _normalise_entry(existing.get(f, {})) or {}
+            prev = _prev_entry(f)
             entry: dict = {"mtime": mtime}
             if kind in ("ast", "both"):
                 entry["ast_hash"] = h
@@ -1097,7 +1170,7 @@ def save_manifest(
             else:
                 # Preserve semantic_hash only when content is unchanged
                 entry["semantic_hash"] = prev.get("semantic_hash", "") if h == prev.get("ast_hash", "") else ""
-            manifest[f] = entry
+            manifest[_manifest_key(f, root)] = entry
     Path(manifest_path).parent.mkdir(parents=True, exist_ok=True)
     Path(manifest_path).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -1145,12 +1218,24 @@ def detect_incremental(
         full["new_total"] = full["total_files"]
         return full
 
+    # Manifests written with a relative key (portable graphify-out/, #777) are
+    # keyed against the resolved scan root. Re-anchor lookups so both the new
+    # relative form and the legacy absolute form resolve. detect() always
+    # produces absolute paths in full["files"].
+    resolved_root = Path(root).resolve()
+
+    def _lookup(f: str):
+        stored = manifest.get(f)
+        if stored is not None:
+            return stored
+        return manifest.get(_manifest_key(f, resolved_root))
+
     new_files: dict[str, list[str]] = {k: [] for k in full["files"]}
     unchanged_files: dict[str, list[str]] = {k: [] for k in full["files"]}
 
     for ftype, file_list in full["files"].items():
         for f in file_list:
-            stored = manifest.get(f)
+            stored = _lookup(f)
             try:
                 current_mtime = Path(f).stat().st_mtime
             except Exception:
@@ -1183,9 +1268,15 @@ def detect_incremental(
             else:
                 unchanged_files[ftype].append(f)
 
-    # Files in manifest that no longer exist - their cached nodes are now ghost nodes
+    # Files in manifest that no longer exist - their cached nodes are now ghost nodes.
+    # Match in both key forms so a relative-keyed manifest (#777) is not seen as
+    # "all deleted": a manifest key counts as present if it equals a current
+    # absolute path or its root-relative form.
     current_files = {f for flist in full["files"].values() for f in flist}
-    deleted_files = [f for f in manifest if f not in current_files]
+    current_rel = {_manifest_key(f, resolved_root) for f in current_files}
+    deleted_files = [
+        f for f in manifest if f not in current_files and f not in current_rel
+    ]
 
     new_total = sum(len(v) for v in new_files.values())
     full["incremental"] = True
