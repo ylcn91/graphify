@@ -1,5 +1,6 @@
 """graphify CLI - `graphify install` sets up the Claude Code skill."""
 from __future__ import annotations
+import fnmatch
 import json
 import os
 import platform
@@ -40,6 +41,57 @@ def _enforce_graph_size_cap_or_exit(gp: Path) -> None:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
+
+
+# source_file substrings that mark a node as belonging to test code. Matched
+# case-insensitively against the (normalized) source_file so query/lens answers
+# aren't dominated by test scaffolding the user didn't ask about.
+_TEST_FILE_MARKERS = (
+    "test_",
+    "_test.",
+    "/tests/",
+    ".test.",
+    ".spec.",
+    "_spec.",
+    "/spec/",
+    "__tests__/",
+)
+
+
+def _node_source_file_excluded(source_file: str, no_tests: bool, exclude_patterns: list[str]) -> bool:
+    """Return True if a node's source_file should be dropped from the answer.
+
+    ``no_tests`` drops anything that looks like a test file (see
+    ``_TEST_FILE_MARKERS``). ``exclude_patterns`` drops anything whose
+    source_file matches a glob (``fnmatch``) or is a plain substring — both are
+    case-insensitive and path separators are normalized to ``/``.
+    """
+    if not source_file:
+        return False
+    normalized = source_file.replace("\\", "/").lower()
+    if no_tests and any(marker in normalized for marker in _TEST_FILE_MARKERS):
+        return True
+    for pattern in exclude_patterns:
+        pat = pattern.replace("\\", "/").lower()
+        if fnmatch.fnmatch(normalized, pat) or pat in normalized:
+            return True
+    return False
+
+
+def _drop_excluded_nodes(G, no_tests: bool, exclude_patterns: list[str]) -> None:
+    """Remove nodes excluded by --no-tests / --exclude from the graph in place.
+
+    Done before seed selection / BFS so excluded nodes are never used as seeds
+    nor traversed. Shared by the ``query`` and ``lens`` subcommands.
+    """
+    if not no_tests and not exclude_patterns:
+        return
+    doomed = [
+        n
+        for n, d in G.nodes(data=True)
+        if _node_source_file_excluded(str(d.get("source_file", "")), no_tests, exclude_patterns)
+    ]
+    G.remove_nodes_from(doomed)
 
 
 def _check_skill_version(skill_dst: Path) -> None:
@@ -1473,12 +1525,16 @@ def main() -> None:
         print("    --dfs                   use depth-first instead of breadth-first")
         print("    --context C             explicit edge-context filter (repeatable)")
         print("    --budget N              cap output at N tokens (default 2000)")
+        print("    --no-tests              exclude nodes whose source_file looks like a test")
+        print("    --exclude PATTERN       exclude nodes whose source_file matches glob/substring (repeatable)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
         print("  lens <path> \"<question>\"  build code graph if stale (no LLM), then answer compactly")
         print("    --rebuild               force an AST-only rebuild before querying")
         print("    --budget N              cap output at N tokens (default 600)")
         print("    --depth N               traversal depth (default 2)")
         print("    --dfs / --context C     depth-first / explicit edge-context filter (repeatable)")
+        print("    --no-tests              exclude nodes whose source_file looks like a test")
+        print("    --exclude PATTERN       exclude nodes whose source_file matches glob/substring (repeatable)")
         print("  affected \"X\"             reverse traversal to find nodes impacted by X")
         print("    --relation R            edge relation to traverse in reverse (repeatable)")
         print("    --depth N               reverse traversal depth (default 2)")
@@ -1794,7 +1850,7 @@ def main() -> None:
             sys.exit(1)
     elif cmd == "query":
         if len(sys.argv) < 3:
-            print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--graph path]", file=sys.stderr)
+            print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--budget N] [--no-tests] [--exclude PATTERN] [--graph path]", file=sys.stderr)
             sys.exit(1)
         from graphify.serve import _query_graph_text
         from graphify.security import sanitize_label
@@ -1804,10 +1860,21 @@ def main() -> None:
         budget = 2000
         graph_path = _default_graph_path()
         context_filters: list[str] = []
+        no_tests = False
+        exclude_patterns: list[str] = []
         args = sys.argv[3:]
         i = 0
         while i < len(args):
-            if args[i] == "--budget" and i + 1 < len(args):
+            if args[i] == "--no-tests":
+                no_tests = True
+                i += 1
+            elif args[i] == "--exclude" and i + 1 < len(args):
+                exclude_patterns.append(args[i + 1])
+                i += 2
+            elif args[i].startswith("--exclude="):
+                exclude_patterns.append(args[i].split("=", 1)[1])
+                i += 1
+            elif args[i] == "--budget" and i + 1 < len(args):
                 try:
                     budget = int(args[i + 1])
                 except ValueError:
@@ -1856,6 +1923,7 @@ def main() -> None:
         except Exception as exc:
             print(f"error: could not load graph: {exc}", file=sys.stderr)
             sys.exit(1)
+        _drop_excluded_nodes(G, no_tests, exclude_patterns)
         print(
             _query_graph_text(
                 G,
@@ -1877,7 +1945,7 @@ def main() -> None:
         if len(args) < 2:
             print(
                 'Usage: graphify lens <path> "<question>" '
-                "[--rebuild] [--budget N] [--depth N] [--dfs] [--context C]",
+                "[--rebuild] [--budget N] [--depth N] [--dfs] [--context C] [--no-tests] [--exclude PATTERN]",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -1887,6 +1955,8 @@ def main() -> None:
         depth = 2
         use_dfs = False
         context_filters = []
+        no_tests = False
+        exclude_patterns: list[str] = []
         rest = args[2:]
         i = 0
         while i < len(rest):
@@ -1895,6 +1965,12 @@ def main() -> None:
                 rebuild = True; i += 1
             elif a == "--dfs":
                 use_dfs = True; i += 1
+            elif a == "--no-tests":
+                no_tests = True; i += 1
+            elif a == "--exclude" and i + 1 < len(rest):
+                exclude_patterns.append(rest[i + 1]); i += 2
+            elif a.startswith("--exclude="):
+                exclude_patterns.append(a.split("=", 1)[1]); i += 1
             elif a in ("--budget", "--depth") and i + 1 < len(rest):
                 try:
                     val = int(rest[i + 1])
@@ -1956,6 +2032,7 @@ def main() -> None:
         except Exception as exc:
             print(f"error: could not load graph: {exc}", file=sys.stderr)
             sys.exit(1)
+        _drop_excluded_nodes(G, no_tests, exclude_patterns)
         print(
             _query_graph_text(
                 G,
